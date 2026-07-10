@@ -18,6 +18,7 @@ import glob
 import html
 import json
 import logging
+import os
 import subprocess
 import threading
 import time
@@ -49,6 +50,8 @@ BOT_COMMANDS = [
     {"command": "start", "description": "Intro and what you can send"},
     {"command": "help", "description": "Intro and what you can send"},
     {"command": "status", "description": "Connection and voice status"},
+    {"command": "health", "description": "Quick bridge and session health"},
+    {"command": "diag", "description": "Safe diagnostics for the owner"},
     {"command": "setkey", "description": "Enable voice (your ElevenLabs API key)"},
     {"command": "id", "description": "Show your Telegram id"},
 ]
@@ -62,6 +65,16 @@ from .readers import _short  # noqa: E402
 _TUI_VERBS = {"Read": "📄", "List": "📂", "Search": "🔎", "Ran": "🛠️",
               "Edit": "✏️", "Wrote": "✏️", "Added": "✏️", "Updated": "✏️",
               "Deleted": "🗑️", "Removed": "🗑️"}
+
+
+def _blocking_session_prompt(pane: str) -> str | None:
+    """Identify known interactive screens that are unsafe for Telegram key injection."""
+    text = (pane or "").lower()
+    if "update available!" in text and "press enter to continue" in text:
+        return "codex_update_prompt"
+    if "trust" in text and ("press enter" in text or "continue" in text):
+        return "workspace_trust_prompt"
+    return None
 
 
 def _extract_tui_tools(pane: str) -> list:
@@ -151,6 +164,7 @@ class AttachBridge:
         self._seen_tools: set = set()
         self._tui_seen: set = set()          # Codex TUI scrape: tool lines already shown this turn
         self._turn_text_sent = False         # has any text been forwarded this turn (bubble gate)
+        self._bridge_started = time.monotonic()
 
     # ---- transcript resolution --------------------------------------------
     def _codex_sessions_dir(self) -> Path:
@@ -295,11 +309,17 @@ class AttachBridge:
     # ---- lifecycle ---------------------------------------------------------
     def run(self) -> None:
         me = self.tg.get_me()
-        log.info("Attach bridge live as @%s → tmux '%s', owner=%s",
-                 me.get("username"), self.cfg.tmux_session, self._owner_chat)
+        log.info("BRIDGE_STARTED bot=@%s tmux=%s owner=%s agent=%s",
+                 me.get("username"), self.cfg.tmux_session, self._owner_chat, self.cfg.agent)
         self.tg.set_my_commands(BOT_COMMANDS)    # enable the "/" command menu in Telegram
         if not self._session.alive:
             raise RuntimeError(f"tmux session '{self.cfg.tmux_session}' not found")
+        blocked = _blocking_session_prompt(self._session._capture())
+        if blocked:
+            raise RuntimeError(
+                f"tmux session '{self.cfg.tmux_session}' is not ready: {blocked}; "
+                "resolve the prompt in tmux before starting the bridge"
+            )
         # Start tailing at EOF. If we've run before (the ledger has entries), rewind to the start
         # of the current turn so a reply written while we were restarting still gets forwarded —
         # the ledger dedups, so nothing already delivered is re-sent. On the very first run we do
@@ -315,7 +335,13 @@ class AttachBridge:
         if self.cfg.agent == "codex":
             # Codex logs tools to the rollout only at completion → scrape the TUI for LIVE bubbles.
             threading.Thread(target=self._tui_scrape_loop, daemon=True).start()
-        self._inbound_loop()
+        try:
+            self._inbound_loop()
+        except BaseException:
+            log.exception("BRIDGE_STOPPED reason=unhandled_exception")
+            raise
+        else:
+            log.info("BRIDGE_STOPPED reason=normal")
 
     def _resume_position(self) -> None:
         """Find the most recent non-empty user message and rewind ``_tpos`` to just after it,
@@ -370,7 +396,8 @@ class AttachBridge:
                 line = line.strip()
                 if line:
                     out.append(json.loads(line))
-        except (OSError, ValueError):
+        except (OSError, ValueError) as e:
+            log.error("QUEUE_LOAD_FAILED path=%s error=%s", self._queue_path, e)
             return []
         return out
 
@@ -384,8 +411,9 @@ class AttachBridge:
                 for item in self._pending_send:
                     f.write(json.dumps(item, ensure_ascii=False) + "\n")
             tmp.replace(self._queue_path)          # atomic, no os import needed
-        except OSError:
-            pass
+        except OSError as e:
+            log.error("QUEUE_PERSIST_FAILED path=%s queued=%d error=%s",
+                      self._queue_path, len(self._pending_send), e)
 
     def _enqueue(self, text: str, key: str | None) -> None:
         self._pending_send.append({"text": text, "key": key})
@@ -543,7 +571,7 @@ class AttachBridge:
                 "progress, what tools it runs, and the reply. You can also send *photos* and "
                 "*files*, and react with ❤️ as quick feedback.\n\n"
                 f"🎤 Voice transcription: {voice}.\n\n"
-                "Commands: /help · /status · /id · /setkey")
+                "Commands: /help · /status · /health · /diag · /id · /setkey")
             return True
         if cmd == "id":
             self.tg.send_message(chat_id, f"Your Telegram id: `{chat_id}`")
@@ -553,6 +581,37 @@ class AttachBridge:
             self.tg.send_message(chat_id,
                 f"✅ Connected — *{agent}* in tmux session `{self.cfg.tmux_session}`.\n"
                 f"🎤 Voice (ElevenLabs): {voice}")
+            return True
+        if cmd == "health":
+            session_ok = self._session.alive
+            state = "working" if self._turn_active.is_set() else "idle"
+            pending = len(self._pending_send)
+            icon = "✅" if session_ok and pending == 0 else "⚠️"
+            self.tg.send_message(
+                chat_id,
+                f"{icon} Bridge: running\n"
+                f"tmux `{self.cfg.tmux_session}`: {'running' if session_ok else 'missing'}\n"
+                f"turn: {state}\n"
+                f"outbound queue: {pending}",
+            )
+            return True
+        if cmd == "diag":
+            from . import __version__
+            session_ok = self._session.alive
+            transcript = self._transcript.name if self._transcript else "not detected"
+            uptime = int(max(0.0, time.monotonic() - self._bridge_started))
+            self.tg.send_message(
+                chat_id,
+                "Agent2Telegram diagnostics\n"
+                f"version: `{__version__}`\n"
+                f"pid: `{os.getpid()}`\n"
+                f"uptime: `{uptime}s`\n"
+                f"agent: `{self.cfg.agent}`\n"
+                f"tmux: `{self.cfg.tmux_session}` ({'running' if session_ok else 'missing'})\n"
+                f"transcript: `{transcript}`\n"
+                f"turn active: `{self._turn_active.is_set()}`\n"
+                f"queued replies: `{len(self._pending_send)}`",
+            )
             return True
         if cmd == "setkey":
             return self._set_voice_key(arg, chat_id, message_id)
@@ -698,8 +757,8 @@ class AttachBridge:
                 elif self._turn_end is not None and self._turn_end.exists():
                     self._end_turn()
                 elif self._turn_active.is_set() and time.monotonic() - self._last_activity > IDLE_DONE:
-                    self._status_clear()
-                    self._turn_active.clear()
+                    log.warning("TURN_END_FALLBACK reason=idle_timeout idle=%.1fs", IDLE_DONE)
+                    self._finish_turn()
                 self._beat()                  # reached only on a full, non-blocking forward cycle
             except Exception as e:
                 log.error("outbound error: %s", e)
