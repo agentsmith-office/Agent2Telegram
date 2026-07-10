@@ -29,6 +29,12 @@ class TurnBackstopTests(unittest.TestCase):
         self.assertEqual(sent, ["RECOVERED"])
         self.assertFalse(bridge._turn_active.is_set())
 
+    def test_codex_reader_requires_authoritative_turn_end(self):
+        from agent2telegram.readers import CodexReader, ClaudeCodeReader
+
+        self.assertTrue(CodexReader.emits_turn_end)
+        self.assertFalse(ClaudeCodeReader.emits_turn_end)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -165,6 +165,7 @@ class AttachBridge:
         self._tui_seen: set = set()          # Codex TUI scrape: tool lines already shown this turn
         self._turn_text_sent = False         # has any text been forwarded this turn (bubble gate)
         self._bridge_started = time.monotonic()
+        self._idle_warned = False
 
     # ---- transcript resolution --------------------------------------------
     def _codex_sessions_dir(self) -> Path:
@@ -523,6 +524,7 @@ class AttachBridge:
         self._max_gap = 0.0
         self._last_typing = now
         self._turn_text_sent = False             # gate TUI bubbles until intro text lands
+        self._idle_warned = False
         # Seed the TUI dedup with tool lines ALREADY on screen from previous turns, so the
         # scraper only emits calls that appear DURING this turn — otherwise stale lines still
         # visible in the pane get re-sent as bubbles under the new turn.
@@ -757,8 +759,16 @@ class AttachBridge:
                 elif self._turn_end is not None and self._turn_end.exists():
                     self._end_turn()
                 elif self._turn_active.is_set() and time.monotonic() - self._last_activity > IDLE_DONE:
-                    log.warning("TURN_END_FALLBACK reason=idle_timeout idle=%.1fs", IDLE_DONE)
-                    self._finish_turn()
+                    if self._reader.emits_turn_end:
+                        if not self._idle_warned:
+                            log.warning(
+                                "TURN_STALLED reason=transcript_idle idle=%.1fs action=wait_for_authoritative_end",
+                                time.monotonic() - self._last_activity,
+                            )
+                            self._idle_warned = True
+                    else:
+                        log.warning("TURN_END_FALLBACK reason=idle_timeout idle=%.1fs", IDLE_DONE)
+                        self._finish_turn()
                 self._beat()                  # reached only on a full, non-blocking forward cycle
             except Exception as e:
                 log.error("outbound error: %s", e)
