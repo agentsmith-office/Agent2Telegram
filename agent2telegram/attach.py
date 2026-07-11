@@ -77,6 +77,37 @@ def _blocking_session_prompt(pane: str) -> str | None:
     return None
 
 
+def _empty_turn_notice(pane: str) -> tuple[str, str]:
+    """Classify a Codex turn that completed without an assistant message.
+
+    Codex prints quota failures in the TUI but records only ``task_complete`` with a null
+    ``last_agent_message`` in its rollout. Inspect only the bottom of the pane, where the result
+    of the just-finished prompt is rendered, so an older visible quota error cannot taint a later
+    empty turn.
+    """
+    tail = "\n".join((pane or "").splitlines()[-12:])
+    lower = tail.lower()
+    if "you've hit your usage limit" in lower or "you have hit your usage limit" in lower:
+        retry = _re.search(r"try\s+again\s+at\s+([^\n.]+(?:\.[mM]\.)?)", tail, _re.IGNORECASE)
+        when = f" Další pokus je možný přibližně v {retry.group(1).strip()}." if retry else ""
+        return (
+            "usage_limit",
+            "⚠️ Codex narazil na limit používání a požadavek proto nedokončil." + when
+            + " Zadání nebylo potichu zahazeno; po obnovení kapacity jej pošlete znovu.",
+        )
+    if "rate limit" in lower or "too many requests" in lower:
+        return (
+            "rate_limit",
+            "⚠️ Codex narazil na dočasný rate limit a požadavek nedokončil. "
+            "Po krátké době jej prosím pošlete znovu.",
+        )
+    return (
+        "empty_response",
+        "⚠️ Codex ukončil požadavek bez odpovědi. Bridge zůstal aktivní, ale nemá žádný "
+        "výsledek k doručení; požadavek prosím zopakujte.",
+    )
+
+
 def _extract_tui_tools(pane: str) -> list:
     """Pull live tool/web-search lines out of a Codex TUI capture, as bubble summaries."""
     out = []
@@ -846,6 +877,15 @@ class AttachBridge:
             if out:
                 self._send_final(out)
                 log.info("TURN END backstop → forwarded final answer %r", out[:30])
+            else:
+                try:
+                    pane = self._session._capture()
+                except Exception as e:
+                    log.warning("EMPTY_TURN_CAPTURE_FAILED error=%s", e)
+                    pane = ""
+                reason, notice = _empty_turn_notice(pane)
+                self._send_final(notice)
+                log.warning("TURN END no_agent_answer reason=%s action=notify_owner", reason)
         self._turn_active.clear()
         self._pending_turn_end = False
         self._consume_turn_end()

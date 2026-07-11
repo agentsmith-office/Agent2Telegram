@@ -5,12 +5,27 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from agent2telegram.attach import AttachBridge
+from agent2telegram.attach import AttachBridge, _empty_turn_notice
 from agent2telegram.readers import CodexReader
 from agent2telegram.session import TmuxSession
 
 
 class TurnBackstopTests(unittest.TestCase):
+    def test_usage_limit_without_agent_message_is_reported(self):
+        reason, notice = _empty_turn_notice(
+            "› [TG] Odpověz.\n\n■ You've hit your usage limit. Please try again at 12:31 PM."
+        )
+
+        self.assertEqual(reason, "usage_limit")
+        self.assertIn("limit používání", notice)
+        self.assertIn("12:31 PM", notice)
+
+    def test_unknown_empty_turn_is_never_silent(self):
+        reason, notice = _empty_turn_notice("› [TG] Odpověz.\n\n■ Turn ended")
+
+        self.assertEqual(reason, "empty_response")
+        self.assertIn("bez odpovědi", notice)
+
     def test_finish_turn_forwards_unsent_final_answer(self):
         bridge = object.__new__(AttachBridge)
         bridge._turn_active = threading.Event()
