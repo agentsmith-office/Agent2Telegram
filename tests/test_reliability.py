@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from agent2telegram.attach import AttachBridge
+from agent2telegram.readers import CodexReader
 from agent2telegram.session import TmuxSession
 
 
@@ -34,6 +35,25 @@ class TurnBackstopTests(unittest.TestCase):
 
         self.assertEqual(sent, ["RECOVERED"])
         self.assertFalse(bridge._turn_active.is_set())
+
+    def test_backstop_never_reuses_answer_from_previous_turn(self):
+        with tempfile.TemporaryDirectory() as td:
+            transcript = Path(td) / "rollout.jsonl"
+            old = (
+                '{"timestamp":"old","type":"event_msg","payload":'
+                '{"type":"agent_message","message":"STALE ANSWER"}}\n'
+            )
+            transcript.write_text(old, "utf-8")
+
+            bridge = object.__new__(AttachBridge)
+            bridge._transcript = transcript
+            bridge._reader = CodexReader()
+            bridge._turn_transcript_start = transcript.stat().st_size
+            with transcript.open("a", encoding="utf-8") as f:
+                f.write('{"type":"event_msg","payload":{"type":"task_complete",'
+                        '"last_agent_message":null}}\n')
+
+            self.assertIsNone(bridge._last_assistant_text())
 
     def test_codex_reader_requires_authoritative_turn_end(self):
         from agent2telegram.readers import CodexReader, ClaudeCodeReader

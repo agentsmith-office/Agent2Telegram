@@ -156,6 +156,10 @@ class AttachBridge:
         self._task_path = (self._signal.parent / f"inflight_task_{_slug}.json") if self._signal else None
         self._inflight_task = self._load_inflight_task()
         self._tpos = 0
+        # Byte offset at which the current injected Telegram turn began. The turn-end backstop
+        # must never recover assistant text from before this boundary: Codex can legitimately
+        # complete an acknowledgement-only turn with last_agent_message=null.
+        self._turn_transcript_start = 0
         self._turn_active = threading.Event()
         self._task_started = threading.Event()  # Codex transcript acknowledgement of submission
         self._turn_from_tg = False           # is the current transcript turn Telegram-originated?
@@ -654,6 +658,11 @@ class AttachBridge:
         self._last_activity = time.monotonic()   # keep typing lit from the very start
         self._task_started.clear()
         try:
+            transcript = getattr(self, "_transcript", None)
+            self._turn_transcript_start = transcript.stat().st_size if transcript else 0
+        except OSError:
+            self._turn_transcript_start = 0
+        try:
             self._session.inject(text)
             if self.cfg.agent == "codex" and not self._task_started.wait(2.0):
                 log.warning("SUBMIT_RETRY reason=no_task_started action=press_enter")
@@ -789,14 +798,19 @@ class AttachBridge:
                 pass
 
     def _last_assistant_text(self) -> str | None:
-        """The most recent assistant text in the transcript (the turn's final answer). Read-only
-        tail scan — used purely by the turn-end backstop, doesn't touch the live _tpos cursor."""
+        """Most recent assistant text written during the current injected Telegram turn.
+
+        The byte boundary is captured immediately before injection. This is intentionally scoped:
+        a valid Codex turn may finish with no assistant message, and falling back to text from an
+        earlier turn would duplicate a stale answer into Telegram.
+        """
         if not self._transcript:
             return None
         try:
             size = self._transcript.stat().st_size
+            start = min(size, max(0, self._turn_transcript_start))
             with open(self._transcript, "rb") as f:
-                f.seek(max(0, size - 2_000_000))
+                f.seek(max(start, size - 2_000_000))
                 tail = f.read()
         except OSError:
             return None
