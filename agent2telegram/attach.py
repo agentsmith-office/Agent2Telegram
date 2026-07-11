@@ -149,8 +149,15 @@ class AttachBridge:
         # NEVER silently lost. Survives restarts (re-loaded below). Per-bridge (tmux slug).
         self._queue_path = (self._signal.parent / f"outbound_queue_{_slug}.jsonl") if self._signal else None
         self._pending_send: list = self._load_queue()
+        # In-flight Telegram task ledger.  Unlike the Codex transcript this is tiny, explicit and
+        # independent of the agent process, so a brand-new tmux session after a machine reboot can
+        # continue the task that was active when power went away.  boot_id distinguishes a bridge
+        # crash (same tmux/task still running: do not inject twice) from a real reboot.
+        self._task_path = (self._signal.parent / f"inflight_task_{_slug}.json") if self._signal else None
+        self._inflight_task = self._load_inflight_task()
         self._tpos = 0
         self._turn_active = threading.Event()
+        self._task_started = threading.Event()  # Codex transcript acknowledgement of submission
         self._turn_from_tg = False           # is the current transcript turn Telegram-originated?
         self._last_activity = 0.0            # monotonic ts of last transcript activity (for typing)
         self._status = {"mid": None, "shown": ""}   # live one-line tool-call status bubble
@@ -336,6 +343,7 @@ class AttachBridge:
         if self.cfg.agent == "codex":
             # Codex logs tools to the rollout only at completion → scrape the TUI for LIVE bubbles.
             threading.Thread(target=self._tui_scrape_loop, daemon=True).start()
+        self._restore_inflight_task()
         try:
             self._inbound_loop()
         except BaseException:
@@ -388,6 +396,91 @@ class AttachBridge:
             pass
 
     # ---- durable outbound delivery (never drop a reply) --------------------
+    @staticmethod
+    def _boot_id() -> str:
+        try:
+            return Path("/proc/sys/kernel/random/boot_id").read_text("utf-8").strip()
+        except OSError:
+            return "unknown"
+
+    def _load_inflight_task(self) -> dict | None:
+        if self._task_path is None or not self._task_path.exists():
+            return None
+        try:
+            value = json.loads(self._task_path.read_text("utf-8"))
+            return value if isinstance(value, dict) and value.get("text") else None
+        except (OSError, ValueError) as e:
+            log.error("TASK_LOAD_FAILED path=%s error=%s", self._task_path, e)
+            return None
+
+    def _persist_inflight_task(self, text: str, *, message_id: int | None = None) -> None:
+        if self._task_path is None:
+            return
+        task = {
+            "text": text,
+            "message_id": message_id,
+            "accepted_at": int(time.time()),
+            "accepted_boot_id": self._boot_id(),
+            "resumed_boot_id": None,
+        }
+        try:
+            self._task_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self._task_path.parent / (self._task_path.name + ".tmp")
+            tmp.write_text(json.dumps(task, ensure_ascii=False, indent=2) + "\n", "utf-8")
+            tmp.replace(self._task_path)
+            self._inflight_task = task
+        except OSError as e:
+            # Never inject a task that we failed to journal: that would recreate the original
+            # silent-loss window on reboot.
+            raise RuntimeError(f"could not persist in-flight task: {e}") from e
+
+    def _write_inflight_task(self) -> None:
+        if self._task_path is None or not self._inflight_task:
+            return
+        tmp = self._task_path.parent / (self._task_path.name + ".tmp")
+        tmp.write_text(json.dumps(self._inflight_task, ensure_ascii=False, indent=2) + "\n", "utf-8")
+        tmp.replace(self._task_path)
+
+    def _clear_inflight_task(self) -> None:
+        self._inflight_task = None
+        if self._task_path is not None:
+            try:
+                self._task_path.unlink()
+            except OSError:
+                pass
+
+    def _restore_inflight_task(self) -> None:
+        """Restore turn routing after a bridge crash; inject once after an actual machine reboot."""
+        task = self._inflight_task
+        if not task:
+            return
+        self._turn_active.set()
+        self._turn_from_tg = True
+        self._last_activity = time.monotonic()
+        current_boot = self._boot_id()
+        if task.get("accepted_boot_id") == current_boot or task.get("resumed_boot_id") == current_boot:
+            log.info("TASK_RESTORE mode=same_boot action=follow_existing_turn")
+            return
+
+        # Claim this boot before injection.  If the bridge itself crashes during resume, its next
+        # start follows the existing tmux turn instead of submitting a duplicate.
+        task["resumed_boot_id"] = current_boot
+        task["resumed_at"] = int(time.time())
+        self._write_inflight_task()
+        if self._owner_chat is not None:
+            self.tg.send_message(
+                self._owner_chat,
+                "♻️ Server znovu naběhl. Automaticky navazuji na rozpracovaný úkol.",
+            )
+        resume = (
+            "Server/process byl během tohoto úkolu restartován. Automaticky pokračuj v původním "
+            "úkolu níže. Nejdřív zkontroluj aktuální stav a již provedené změny; neopakuj "
+            "nevratné kroky. Dokonči bezpečně zbývající práci, ověř výsledek a pošli uživateli "
+            "závěrečný stav.\n\nPŮVODNÍ ÚKOL:\n" + str(task["text"])
+        )
+        log.info("TASK_RESTORE mode=new_boot action=resume message_id=%s", task.get("message_id"))
+        self._inject(resume)
+
     def _load_queue(self) -> list:
         if self._queue_path is None or not self._queue_path.exists():
             return []
@@ -547,13 +640,24 @@ class AttachBridge:
             note = self._download_note(msg, chat_id)
             text = f"{text}\n{note}".strip() if note else text
         if text:
+            try:
+                self._persist_inflight_task(text, message_id=msg.get("message_id"))
+            except Exception as e:
+                log.error("task journal failed: %s", e)
+                self._turn_active.clear()
+                self.tg.send_message(chat_id, "⚠️ Úkol se nepodařilo bezpečně uložit; nebyl spuštěn.")
+                return
             self._inject(text)
 
     def _inject(self, text: str) -> None:
         self._turn_active.set()
         self._last_activity = time.monotonic()   # keep typing lit from the very start
+        self._task_started.clear()
         try:
             self._session.inject(text)
+            if self.cfg.agent == "codex" and not self._task_started.wait(2.0):
+                log.warning("SUBMIT_RETRY reason=no_task_started action=press_enter")
+                self._session.submit()
         except Exception as e:
             log.error("inject failed: %s", e)
             self._turn_active.clear()
@@ -732,6 +836,8 @@ class AttachBridge:
         self._pending_turn_end = False
         self._consume_turn_end()
         if was_active:
+            self._clear_inflight_task()
+        if was_active:
             log.info("TURN END t=%.2f dur=%.1fs typing_fired=%d max_gap=%.2fs",
                      time.time(), time.monotonic() - self._turn_started,
                      self._typing_count, self._max_gap)
@@ -848,6 +954,7 @@ class AttachBridge:
             self._status_clear()                         # final message → drop the technical bubble
             self._send_final(answer)                     # reliable: queue + retry on send failure
             self._turn_active.clear()
+            self._clear_inflight_task()
 
     def _drain_transcript(self) -> None:
         if not self._transcript or not self._transcript.exists():
@@ -900,6 +1007,7 @@ class AttachBridge:
             self._turn_from_tg = ev.text.lstrip().startswith(self._origins)
             return
         if ev.kind == "turn_start":
+            self._task_started.set()
             return                              # inbound already lit typing; nothing else to do
         if ev.kind == "turn_end":
             self._pending_turn_end = True       # outbound loop finishes the turn after this drain
