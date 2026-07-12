@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from . import __version__, adapters
+from .auth import AUTH_REQUIRED_NOTICE, AuthState, classify_auth_error
 from .config import Config, _state_dir
 from .telegram import TelegramClient
 
@@ -51,6 +52,7 @@ class Bridge:
         self.cfg = cfg
         self.tg = client or TelegramClient(cfg.token)
         self.adapter = adapters.build(cfg)
+        self._auth = AuthState(cfg.agent)
         self._allowed = set(cfg.allowed_user_ids)
         self._stt_key = cfg.elevenlabs_api_key
         self._stop = threading.Event()
@@ -62,6 +64,7 @@ class Bridge:
 
     # ---- lifecycle ---------------------------------------------------------
     def run(self) -> None:
+        self._auth.probe()
         me = self._connect()
         log.info("Connected as @%s — agent=%s, authorized users=%s",
                  me.get("username"), self.cfg.agent, sorted(self._allowed) or "(none!)")
@@ -228,6 +231,23 @@ class Bridge:
                 f"🤖 Agent2Telegram v{__version__}\nagent: {self.cfg.agent}\nyou: {authed}",
             )
             return True
+        if cmd == "health":
+            degraded = self._auth.status == "login_required"
+            self.tg.send_message(
+                chat_id,
+                f"{'⚠️' if degraded else '✅'} Bridge: running\n"
+                f"agent: {self.cfg.agent}\n{self._auth.health_line()}",
+            )
+            return True
+        if cmd == "diag":
+            lines = [
+                "Agent2Telegram diagnostics",
+                f"version: `{__version__}`",
+                f"agent: `{self.cfg.agent}`",
+                *self._auth.diag_lines(),
+            ]
+            self.tg.send_message(chat_id, "\n".join(lines))
+            return True
         if cmd == "reset":
             if user_id in self._allowed:
                 self._reset_chat(chat_id)
@@ -273,8 +293,18 @@ class Bridge:
                 reply = self.adapter.run(prompt, chat_dir=chat_dir, is_continuation=is_cont)
             except Exception as e:
                 log.error("agent run failed for chat %s: %s", chat_id, e)
-                self.tg.send_message(chat_id, f"⚠️ Agent error: {e}")
+                if classify_auth_error(str(e)):
+                    first = self._auth.failure(str(e))
+                    self.tg.send_message(
+                        chat_id,
+                        AUTH_REQUIRED_NOTICE if first else
+                        "⚠️ Codex CLI stále vyžaduje přihlášení pomocí `codex login`; "
+                        "požadavek nebyl proveden.",
+                    )
+                else:
+                    self.tg.send_message(chat_id, f"⚠️ Agent error: {e}")
                 return
+        self._auth.success()
         try:
             self._marker(chat_dir).touch()
         except OSError:

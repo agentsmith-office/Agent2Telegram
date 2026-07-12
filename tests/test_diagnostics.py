@@ -5,6 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from agent2telegram.attach import AttachBridge
+from agent2telegram.auth import AuthState
 
 
 class _Telegram:
@@ -27,6 +28,7 @@ class DiagnosticCommandTests(unittest.TestCase):
         self.bridge._pending_send = []
         self.bridge._transcript = Path("rollout-safe.jsonl")
         self.bridge._bridge_started = time.monotonic() - 10
+        self.bridge._auth = AuthState("codex", path=Path("/nonexistent/test-auth-state.json"))
 
     def test_health_reports_runtime_state(self):
         self.assertTrue(self.bridge._handle_command("/health", 7))

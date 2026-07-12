@@ -41,6 +41,7 @@ class TurnBackstopTests(unittest.TestCase):
         bridge._typing_count = 1
         bridge._max_gap = 0.0
         bridge._status_clear = lambda: None
+        bridge._auth = type("Auth", (), {"success": lambda self: None})()
         bridge._last_assistant_text = lambda: "[TG] RECOVERED"
         bridge._strip_marker = lambda text: text.removeprefix("[TG] ")
         sent = []

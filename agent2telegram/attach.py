@@ -25,6 +25,7 @@ import time
 from pathlib import Path
 
 from . import readers
+from .auth import AUTH_REQUIRED_NOTICE, AuthState, classify_auth_error
 from .config import Config
 from .session import TmuxSession
 from .telegram import TelegramClient
@@ -87,6 +88,8 @@ def _empty_turn_notice(pane: str) -> tuple[str, str]:
     """
     tail = "\n".join((pane or "").splitlines()[-12:])
     lower = tail.lower()
+    if reason := classify_auth_error(tail):
+        return reason, AUTH_REQUIRED_NOTICE
     if "you've hit your usage limit" in lower or "you have hit your usage limit" in lower:
         retry = _re.search(r"try\s+again\s+at\s+([^\n.]+(?:\.[mM]\.)?)", tail, _re.IGNORECASE)
         when = f" Další pokus je možný přibližně v {retry.group(1).strip()}." if retry else ""
@@ -139,6 +142,7 @@ class AttachBridge:
             raise ValueError("attach mode requires 'tmux_session' in config")
         self.cfg = cfg
         self.tg = client or TelegramClient(cfg.token)
+        self._auth = AuthState(cfg.agent)
         self._allowed = set(cfg.allowed_user_ids)
         self._marker = cfg.progress_marker
         self._origin = cfg.origin_prefix
@@ -351,6 +355,7 @@ class AttachBridge:
 
     # ---- lifecycle ---------------------------------------------------------
     def run(self) -> None:
+        self._auth.probe()
         me = self.tg.get_me()
         log.info("BRIDGE_STARTED bot=@%s tmux=%s owner=%s agent=%s",
                  me.get("username"), self.cfg.tmux_session, self._owner_chat, self.cfg.agent)
@@ -732,13 +737,15 @@ class AttachBridge:
             session_ok = self._session.alive
             state = "working" if self._turn_active.is_set() else "idle"
             pending = len(self._pending_send)
-            icon = "✅" if session_ok and pending == 0 else "⚠️"
+            auth_ok = self._auth.status != "login_required"
+            icon = "✅" if session_ok and pending == 0 and auth_ok else "⚠️"
             self.tg.send_message(
                 chat_id,
                 f"{icon} Bridge: running\n"
                 f"tmux `{self.cfg.tmux_session}`: {'running' if session_ok else 'missing'}\n"
                 f"turn: {state}\n"
-                f"outbound queue: {pending}",
+                f"outbound queue: {pending}\n"
+                f"{self._auth.health_line()}",
             )
             return True
         if cmd == "diag":
@@ -746,18 +753,19 @@ class AttachBridge:
             session_ok = self._session.alive
             transcript = self._transcript.name if self._transcript else "not detected"
             uptime = int(max(0.0, time.monotonic() - self._bridge_started))
-            self.tg.send_message(
-                chat_id,
-                "Agent2Telegram diagnostics\n"
-                f"version: `{__version__}`\n"
-                f"pid: `{os.getpid()}`\n"
-                f"uptime: `{uptime}s`\n"
-                f"agent: `{self.cfg.agent}`\n"
-                f"tmux: `{self.cfg.tmux_session}` ({'running' if session_ok else 'missing'})\n"
-                f"transcript: `{transcript}`\n"
-                f"turn active: `{self._turn_active.is_set()}`\n"
+            lines = [
+                "Agent2Telegram diagnostics",
+                f"version: `{__version__}`",
+                f"pid: `{os.getpid()}`",
+                f"uptime: `{uptime}s`",
+                f"agent: `{self.cfg.agent}`",
+                f"tmux: `{self.cfg.tmux_session}` ({'running' if session_ok else 'missing'})",
+                f"transcript: `{transcript}`",
+                f"turn active: `{self._turn_active.is_set()}`",
                 f"queued replies: `{len(self._pending_send)}`",
-            )
+                *self._auth.diag_lines(),
+            ]
+            self.tg.send_message(chat_id, "\n".join(lines))
             return True
         if cmd == "setkey":
             return self._set_voice_key(arg, chat_id, message_id)
@@ -806,20 +814,37 @@ class AttachBridge:
         """Codex only: scrape the tmux pane for live tool/web-search lines → status bubbles, so
         Codex (whose rollout logs tools only at completion) shows them live like Claude Code."""
         while not self._stop.is_set():
-            if self._turn_active.is_set() and self._turn_from_tg and self._owner_chat is not None:
-                # Hold bubbles until the intro text is forwarded (so the bubble doesn't jump ahead
-                # of "I'll search the web…"), then release; after a short grace show them anyway.
-                ready = self._turn_text_sent or \
-                    (time.monotonic() - self._turn_started) >= TUI_BUBBLE_GRACE
-                if ready:
-                    try:
-                        for summary in _extract_tui_tools(self._session._capture()):
+            if self._turn_active.is_set() and self._owner_chat is not None:
+                try:
+                    pane = self._session._capture()
+                    if self._observe_auth(pane):
+                        self._status_clear()
+                        self._turn_active.clear()
+                        self._clear_inflight_task()
+                    elif self._turn_from_tg:
+                        # Hold bubbles until intro text lands; after a grace show them anyway.
+                        ready = self._turn_text_sent or \
+                            (time.monotonic() - self._turn_started) >= TUI_BUBBLE_GRACE
+                        if not ready:
+                            self._stop.wait(1.0)
+                            continue
+                        for summary in _extract_tui_tools(pane):
                             if summary not in self._tui_seen:
                                 self._tui_seen.add(summary)
                                 self._status_push(summary)
-                    except Exception as e:
-                        log.debug("tui scrape: %s", e)
+                except Exception as e:
+                    log.debug("tui scrape: %s", e)
             self._stop.wait(1.0)
+
+    def _observe_auth(self, text: str) -> bool:
+        """Classify and notify once; raw pane/error text is never persisted or forwarded."""
+        if self._auth.failure(text):
+            log.warning("CODEX_AUTH status=login_required reason=%s", self._auth.data.get("reason"))
+            if self._owner_chat is not None:
+                self.tg.send_message(self._owner_chat, AUTH_REQUIRED_NOTICE)
+                self._turn_text_sent = True
+            return True
+        return self._auth.status == "login_required" and bool(classify_auth_error(text))
 
     def _consume_turn_end(self) -> None:
         if self._turn_end is not None:
@@ -875,6 +900,7 @@ class AttachBridge:
             last = self._last_assistant_text()
             out = self._strip_marker(last) if last else ""
             if out:
+                self._auth.success()
                 self._send_final(out)
                 log.info("TURN END backstop → forwarded final answer %r", out[:30])
             else:
@@ -884,6 +910,7 @@ class AttachBridge:
                     log.warning("EMPTY_TURN_CAPTURE_FAILED error=%s", e)
                     pane = ""
                 reason, notice = _empty_turn_notice(pane)
+                self._auth.failure(pane)
                 self._send_final(notice)
                 log.warning("TURN END no_agent_answer reason=%s action=notify_owner", reason)
         self._turn_active.clear()
@@ -1071,6 +1098,7 @@ class AttachBridge:
         if ev.kind == "text":
             out = self._strip_marker(ev.text)
             if out and ev.key not in self._sent_keys:
+                self._auth.success()
                 # A new progress message → delete the current technical bubble so the next tool
                 # calls re-create it BELOW this message (the bubble always trails at the bottom).
                 self._status_clear()

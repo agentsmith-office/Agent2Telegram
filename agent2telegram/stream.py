@@ -26,6 +26,7 @@ import time
 from pathlib import Path
 
 from .attach import AttachBridge
+from .auth import AUTH_REQUIRED_NOTICE, AuthState, classify_auth_error
 from .config import Config
 from .telegram import TelegramClient
 
@@ -73,6 +74,7 @@ class StreamBridge(AttachBridge):
         # ---- Telegram-side state (mirrors AttachBridge.__init__, minus tmux/transcript) ----
         self.cfg = cfg
         self.tg = client or TelegramClient(cfg.token)
+        self._auth = AuthState(cfg.agent)
         self._allowed = set(cfg.allowed_user_ids)
         self._marker = cfg.progress_marker
         self._origin = cfg.origin_prefix
@@ -97,12 +99,15 @@ class StreamBridge(AttachBridge):
         self._status_path = (self._signal.parent / "stream_status_bubble") if self._signal else None
         self._seen_tools: set = set()
         self._pending_turn_end = False
+        self._turn_text_sent = False
+        self._bridge_started = time.monotonic()
         # ---- Codex stream specifics ----
         self._thread_id: str | None = None         # conversation id → resume keeps context
         self._proc_lock = threading.Lock()         # one turn at a time
 
     # ---- lifecycle ---------------------------------------------------------
     def run(self) -> None:
+        self._auth.probe()
         me = self.tg.get_me()
         log.info("Stream bridge live as @%s → codex exec --json, owner=%s",
                  me.get("username"), self._owner_chat)
@@ -134,19 +139,33 @@ class StreamBridge(AttachBridge):
             self._last_activity = self._turn_started = self._last_typing = now
             self._typing_count = 1
             self._max_gap = 0.0
+            self._turn_text_sent = False
             if self._owner_chat is not None:
                 self.tg.send_chat_action(self._owner_chat, "typing")
             log.info("TURN START t=%.2f", time.time())
             argv = self._codex_argv(text)
             try:
-                proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                         text=True, cwd=str(Path.home()))
             except OSError as e:
                 log.error("codex spawn failed: %s", e)
                 if self._owner_chat is not None:
                     self.tg.send_message(self._owner_chat, f"⚠️ Couldn't start Codex: {e}")
+                    self._turn_text_sent = True
                 self._finish_turn()
                 return
+            stderr_chunks: list[str] = []
+
+            def read_stderr() -> None:
+                if proc.stderr is None:
+                    return
+                for chunk in iter(lambda: proc.stderr.read(2048), ""):
+                    stderr_chunks.append(chunk)
+                    if sum(map(len, stderr_chunks)) > 16000:
+                        del stderr_chunks[:-4]
+
+            stderr_thread = threading.Thread(target=read_stderr, daemon=True)
+            stderr_thread.start()
             try:
                 for line in proc.stdout:            # blocking read, line by line (live)
                     line = line.strip()
@@ -157,12 +176,78 @@ class StreamBridge(AttachBridge):
                         obj = json.loads(line)
                     except json.JSONDecodeError:
                         continue
+                    if classify_auth_error(line):
+                        self._notify_auth(line)
                     self._handle_stream_event(obj)
                 proc.wait(timeout=5)
+                stderr_thread.join(timeout=2)
+                stderr_text = "".join(stderr_chunks)
+                if proc.returncode and classify_auth_error(stderr_text):
+                    self._notify_auth(stderr_text)
+                elif proc.returncode and not self._turn_text_sent and self._owner_chat is not None:
+                    self.tg.send_message(
+                        self._owner_chat,
+                        f"⚠️ Codex skončil s chybou (exit {proc.returncode}) a nevrátil odpověď.",
+                    )
+                    self._turn_text_sent = True
+                elif not self._turn_text_sent and self._owner_chat is not None:
+                    self.tg.send_message(self._owner_chat, "⚠️ Codex ukončil požadavek bez odpovědi.")
+                    self._turn_text_sent = True
             except Exception as e:
                 log.error("stream read error: %s", e)
+                if self._owner_chat is not None and not self._turn_text_sent:
+                    self.tg.send_message(self._owner_chat, f"⚠️ Chyba při čtení odpovědi Codexu: {e}")
+                    self._turn_text_sent = True
             finally:
                 self._finish_turn()
+
+    def _notify_auth(self, text: str) -> None:
+        first = self._auth.failure(text)
+        if self._owner_chat is not None and not self._turn_text_sent:
+            self.tg.send_message(
+                self._owner_chat,
+                AUTH_REQUIRED_NOTICE if first else
+                "⚠️ Codex CLI stále vyžaduje přihlášení pomocí `codex login`; "
+                "požadavek nebyl proveden.",
+            )
+            self._turn_text_sent = True
+
+    def _finish_turn(self) -> None:
+        """Stream mode has no tmux session, transcript, or in-flight attach journal."""
+        self._status_clear()
+        was_active = self._turn_active.is_set()
+        self._turn_active.clear()
+        self._pending_turn_end = False
+        if was_active:
+            log.info("TURN END t=%.2f dur=%.1fs typing_fired=%d max_gap=%.2fs",
+                     time.time(), time.monotonic() - self._turn_started,
+                     self._typing_count, self._max_gap)
+
+    def _handle_command(self, text: str, chat_id: int, message_id: int | None = None) -> bool:
+        cmd = text.split(maxsplit=1)[0].lstrip("/").split("@")[0].lower()
+        if cmd == "health":
+            degraded = self._auth.status == "login_required"
+            state = "working" if self._turn_active.is_set() else "idle"
+            self.tg.send_message(
+                chat_id,
+                f"{'⚠️' if degraded else '✅'} Bridge: running\n"
+                "mode: Codex stream\n"
+                f"turn: {state}\n{self._auth.health_line()}",
+            )
+            return True
+        if cmd == "diag":
+            from . import __version__
+            lines = [
+                "Agent2Telegram diagnostics",
+                f"version: `{__version__}`",
+                "agent: `codex`",
+                "mode: `stream`",
+                f"turn active: `{self._turn_active.is_set()}`",
+                *self._auth.diag_lines(),
+            ]
+            self.tg.send_message(chat_id, "\n".join(lines))
+            return True
+        return super()._handle_command(text, chat_id, message_id)
 
     # ---- stream event → Telegram actions ----------------------------------
     def _handle_stream_event(self, obj: dict) -> None:
@@ -176,9 +261,11 @@ class StreamBridge(AttachBridge):
             out = self._strip_marker(item.get("text", ""))
             key = item.get("id") or out[:40]
             if out and self._owner_chat is not None and key not in self._sent_keys:
+                self._auth.success()
                 self._mark_sent(key)
                 self._status_clear()               # progress/final text → drop the tool bubble
                 self.tg.send_message(self._owner_chat, out)
+                self._turn_text_sent = True
         elif t == "item.started" and itype and itype != "agent_message":
             iid = item.get("id")
             if iid and iid not in self._seen_tools:
