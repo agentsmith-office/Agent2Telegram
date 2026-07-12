@@ -100,7 +100,12 @@ class AuthState:
         self._save()
 
     def probe(self) -> str:
-        """Read Codex's login status without starting a login flow or handling credentials."""
+        """Detect an explicit missing login without claiming that stored credentials still work.
+
+        ``codex login status`` only proves that credentials are present.  It does not exercise a
+        refresh token, so a zero exit status must not promote an unknown or failed state to OK.
+        A real successful Codex response is the authoritative recovery signal.
+        """
         if self.agent != "codex":
             return self.status
         binary = shutil.which("codex")
@@ -114,9 +119,7 @@ class AuthState:
         except (OSError, subprocess.SubprocessError):
             return self.status
         output = "\n".join((proc.stdout or "", proc.stderr or ""))
-        if proc.returncode == 0:
-            self.success()
-        elif classify_auth_error(output):
+        if proc.returncode != 0 and classify_auth_error(output):
             self.failure(output)
         return self.status
 

@@ -51,14 +51,23 @@ class AuthStateTests(unittest.TestCase):
             self.assertEqual(state.status, "ok")
             self.assertEqual(state.data["reason"], "")
 
-    def test_probe_uses_read_only_login_status(self):
+    def test_probe_does_not_treat_stored_credentials_as_verified(self):
         with tempfile.TemporaryDirectory() as td, \
              patch("agent2telegram.auth.shutil.which", return_value="/usr/bin/codex"), \
              patch("agent2telegram.auth.subprocess.run") as run:
             run.return_value = SimpleNamespace(returncode=0, stdout="Logged in", stderr="")
             state = AuthState("codex", path=Path(td) / "auth.json")
-            self.assertEqual(state.probe(), "ok")
+            self.assertEqual(state.probe(), "unknown")
             self.assertEqual(run.call_args.args[0], ["/usr/bin/codex", "login", "status"])
+
+    def test_probe_does_not_clear_a_real_auth_failure(self):
+        with tempfile.TemporaryDirectory() as td, \
+             patch("agent2telegram.auth.shutil.which", return_value="/usr/bin/codex"), \
+             patch("agent2telegram.auth.subprocess.run") as run:
+            run.return_value = SimpleNamespace(returncode=0, stdout="Logged in", stderr="")
+            state = AuthState("codex", path=Path(td) / "auth.json")
+            state.failure("refresh token was revoked")
+            self.assertEqual(state.probe(), "login_required")
 
 
 class StreamAuthTests(unittest.TestCase):
