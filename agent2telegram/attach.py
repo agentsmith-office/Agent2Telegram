@@ -53,6 +53,7 @@ BOT_COMMANDS = [
     {"command": "status", "description": "Connection and voice status"},
     {"command": "health", "description": "Quick bridge and session health"},
     {"command": "diag", "description": "Safe diagnostics for the owner"},
+    {"command": "agents", "description": "All agents health and recovery status"},
     {"command": "setkey", "description": "Enable voice (your ElevenLabs API key)"},
     {"command": "id", "description": "Show your Telegram id"},
 ]
@@ -722,7 +723,7 @@ class AttachBridge:
                 "progress, what tools it runs, and the reply. You can also send *photos* and "
                 "*files*, and react with ❤️ as quick feedback.\n\n"
                 f"🎤 Voice transcription: {voice}.\n\n"
-                "Commands: /help · /status · /health · /diag · /id · /setkey")
+                "Commands: /help · /status · /health · /diag · /agents · /id · /setkey")
             return True
         if cmd == "id":
             self.tg.send_message(chat_id, f"Your Telegram id: `{chat_id}`")
@@ -766,6 +767,10 @@ class AttachBridge:
                 *self._auth.diag_lines(),
             ]
             self.tg.send_message(chat_id, "\n".join(lines))
+            return True
+        if cmd == "agents":
+            from .monitoring import telegram_status
+            self.tg.send_message(chat_id, telegram_status())
             return True
         if cmd == "setkey":
             return self._set_voice_key(arg, chat_id, message_id)

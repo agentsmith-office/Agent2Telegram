@@ -248,6 +248,12 @@ class Bridge:
             ]
             self.tg.send_message(chat_id, "\n".join(lines))
             return True
+        if cmd == "agents":
+            if user_id not in self._allowed:
+                return True
+            from .monitoring import telegram_status
+            self.tg.send_message(chat_id, telegram_status())
+            return True
         if cmd == "reset":
             if user_id in self._allowed:
                 self._reset_chat(chat_id)

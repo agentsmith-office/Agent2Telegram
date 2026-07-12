@@ -9,4 +9,4 @@ Design goals (in priority order):
   3. Zero install friction — the core uses only the Python standard library.
 """
 
-__version__ = "1.2.1"
+__version__ = "1.2.2"
