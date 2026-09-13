@@ -107,6 +107,22 @@ class LongMessageInjectionTests(unittest.TestCase):
             "Long input needs a length-aware settling delay before Enter",
         )
 
+    def test_restart_pane_preserves_tmux_session(self):
+        session = object.__new__(TmuxSession)
+        session.name = "test-session"
+        replies = [
+            type("Result", (), {"stdout": "exec codex\n"})(),
+            type("Result", (), {"stdout": "/home/test\n"})(),
+            type("Result", (), {"stdout": ""})(),
+        ]
+        with patch.object(session, "_exists", return_value=True), \
+             patch("agent2telegram.session._tmux", side_effect=replies) as tmux:
+            session.restart_pane()
+
+        self.assertEqual(tmux.call_args_list[-1].args[:4],
+                         ("respawn-pane", "-k", "-t", "test-session"))
+        self.assertIn("exec codex", tmux.call_args_list[-1].args)
+
     def test_missing_task_start_retries_only_enter(self):
         bridge = object.__new__(AttachBridge)
         bridge.cfg = type("Cfg", (), {"agent": "codex"})()
@@ -173,6 +189,33 @@ class StallDetectionTests(unittest.TestCase):
             self.assertEqual(state["agent"], "sokrates")
             self.assertNotIn("text", state)
             self.assertEqual(bridge._runtime_path.stat().st_mode & 0o777, 0o600)
+
+    def test_cancel_escalates_and_clears_turn_when_interrupt_is_not_acknowledged(self):
+        bridge = self._bridge()
+        bridge._stop = threading.Event()
+        bridge._turn_started_wall = 123
+        bridge._turn_from_tg = True
+        bridge._pending_turn_end = False
+        bridge._cancel_requested = True
+        bridge._cancel_in_progress = True
+        bridge._cancel_lock = threading.Lock()
+        bridge._status_clear = lambda: None
+        bridge._clear_inflight_task = lambda: None
+        bridge._session = type("Session", (), {
+            "interrupts": 0,
+            "restarts": 0,
+            "interrupt": lambda self: setattr(self, "interrupts", self.interrupts + 1),
+            "restart_pane": lambda self: setattr(self, "restarts", self.restarts + 1),
+        })()
+
+        with patch("agent2telegram.attach.CANCEL_GRACE", 0):
+            bridge._cancel_worker(42, 123)
+
+        self.assertEqual(bridge._session.interrupts, 2)
+        self.assertEqual(bridge._session.restarts, 1)
+        self.assertFalse(bridge._turn_active.is_set())
+        self.assertFalse(bridge._cancel_in_progress)
+        self.assertIn("znovu připraven", bridge.tg.sent[-1][1])
 
 class RebootContinuityTests(unittest.TestCase):
     def _bridge(self, root: Path):

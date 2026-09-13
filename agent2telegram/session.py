@@ -145,6 +145,24 @@ class TmuxSession:
             raise SessionError(f"agent session '{self.name}' is gone")
         _tmux("send-keys", "-t", self.name, "C-c")
 
+    def restart_pane(self) -> None:
+        """Restart only the agent process while preserving the tmux session and bridge."""
+        if not self.alive:
+            raise SessionError(f"agent session '{self.name}' is gone")
+        command = _tmux(
+            "display-message", "-p", "-t", self.name, "#{pane_start_command}"
+        ).stdout.strip()
+        cwd = _tmux(
+            "display-message", "-p", "-t", self.name, "#{pane_current_path}"
+        ).stdout.strip()
+        if not command:
+            raise SessionError("tmux pane has no restart command")
+        args = ["respawn-pane", "-k", "-t", self.name]
+        if cwd:
+            args.extend(["-c", cwd])
+        args.append(command)
+        _tmux(*args, timeout=20)
+
     def send(self, text: str) -> str:
         if not self.alive:
             raise SessionError(f"agent session '{self.name}' is gone")

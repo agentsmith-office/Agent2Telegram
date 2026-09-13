@@ -3,6 +3,7 @@ import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from agent2telegram.attach import AttachBridge
 from agent2telegram.auth import AuthState
@@ -32,6 +33,9 @@ class DiagnosticCommandTests(unittest.TestCase):
         self.bridge._turn_started_wall = 0
         self.bridge._last_activity_wall = 0
         self.bridge._runtime_path = None
+        self.bridge._cancel_requested = False
+        self.bridge._cancel_in_progress = False
+        self.bridge._cancel_lock = threading.Lock()
         self.bridge._auth = AuthState("codex", path=Path("/nonexistent/test-auth-state.json"))
 
     def test_health_reports_runtime_state(self):
@@ -55,11 +59,13 @@ class DiagnosticCommandTests(unittest.TestCase):
         )
         self.bridge._turn_active.set()
 
-        self.assertTrue(self.bridge._handle_command("/cancel", 7))
+        with patch("agent2telegram.attach.threading.Thread") as thread:
+            self.assertTrue(self.bridge._handle_command("/cancel", 7))
 
-        self.assertEqual(interrupted, [True])
+        self.assertEqual(interrupted, [])
+        thread.return_value.start.assert_called_once_with()
         self.assertTrue(self.bridge._turn_active.is_set())
-        self.assertIn("Požadavek na zrušení", self.bridge.tg.sent[-1][1])
+        self.assertIn("ověřuji", self.bridge.tg.sent[-1][1])
 
     def test_cancel_is_a_noop_when_idle(self):
         self.bridge._session = SimpleNamespace(

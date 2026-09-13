@@ -39,6 +39,7 @@ log = logging.getLogger("agent2telegram.attach")
 IDLE_DONE = 90.0
 STALL_WARNING = 5 * 60.0
 STALL_CRITICAL = 10 * 60.0
+CANCEL_GRACE = 8.0
 #: How often we re-assert the "typing…" chat action (Telegram shows it for ~5s). Kept well
 #: under that window so a turn never shows a gap, even right after a sent message clears it.
 TYPING_INTERVAL = 1.5
@@ -221,6 +222,9 @@ class AttachBridge:
         self._turn_started_wall = 0
         self._last_activity_wall = 0
         self._runtime_path = (self._signal.parent / f"runtime_{_slug}.json") if self._signal else None
+        self._cancel_requested = False
+        self._cancel_in_progress = False
+        self._cancel_lock = threading.Lock()
 
     # ---- transcript resolution --------------------------------------------
     def _codex_sessions_dir(self) -> Path:
@@ -510,6 +514,7 @@ class AttachBridge:
         self._turn_started_wall = int(task.get("accepted_at") or time.time())
         self._last_activity_wall = int(time.time())
         self._stall_level = 0
+        self._cancel_requested = False
         self._write_runtime("working")
         current_boot = self._boot_id()
         if task.get("accepted_boot_id") == current_boot or task.get("resumed_boot_id") == current_boot:
@@ -675,6 +680,7 @@ class AttachBridge:
         self._turn_text_sent = False             # gate TUI bubbles until intro text lands
         self._idle_warned = False
         self._stall_level = 0
+        self._cancel_requested = False
         self._write_runtime("working")
         # Seed the TUI dedup with tool lines ALREADY on screen from previous turns, so the
         # scraper only emits calls that appear DURING this turn — otherwise stale lines still
@@ -770,17 +776,22 @@ class AttachBridge:
             if not self._turn_active.is_set():
                 self.tg.send_message(chat_id, "ℹ️ Žádný aktivní úkol není třeba rušit.")
                 return True
-            try:
-                self._session.interrupt()
-            except Exception as e:
-                log.error("cancel failed: %s", e)
-                self.tg.send_message(chat_id, "⚠️ Úkol se nepodařilo přerušit; relace zůstala beze změny.")
-                return True
+            with self._cancel_lock:
+                if self._cancel_in_progress:
+                    self.tg.send_message(chat_id, "ℹ️ Zrušení už probíhá a ověřuji jeho výsledek.")
+                    return True
+                self._cancel_in_progress = True
+                self._cancel_requested = True
             self._write_runtime("cancel_requested")
             self.tg.send_message(
                 chat_id,
-                "🛑 Požadavek na zrušení úkolu byl odeslán. Relaci ani Telegram nerestartuji.",
+                "🛑 Ruším úkol a ověřuji, že se skutečně zastavil.",
             )
+            token = self._turn_started_wall
+            threading.Thread(
+                target=self._cancel_worker, args=(chat_id, token),
+                name="a2t-cancel-verifier", daemon=True,
+            ).start()
             return True
         if cmd == "diag":
             from . import __version__
@@ -854,6 +865,61 @@ class AttachBridge:
         return {1: "stalled_warning", 2: "stalled"}.get(
             getattr(self, "_stall_level", 0), "working"
         )
+
+    def _wait_cancel_result(self, token: int, timeout: float) -> str:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline and not self._stop.is_set():
+            if self._turn_started_wall != token:
+                return "superseded"
+            if not self._turn_active.is_set():
+                return "ended"
+            self._stop.wait(0.25)
+        return "pending"
+
+    def _cancel_worker(self, chat_id: int, token: int) -> None:
+        """Cancel a turn, verify it ended, and restart only the pane as a last resort."""
+        try:
+            for attempt in (1, 2):
+                self._session.interrupt()
+                result = self._wait_cancel_result(token, CANCEL_GRACE)
+                if result == "superseded":
+                    return
+                if result == "ended":
+                    self.tg.send_message(chat_id, "✅ Úkol byl skutečně ukončen.")
+                    return
+                log.warning("CANCEL_NOT_ACKNOWLEDGED attempt=%d action=retry", attempt)
+
+            self._write_runtime("cancel_escalating")
+            self.tg.send_message(
+                chat_id,
+                "⚠️ Běžné přerušení nezabralo. Obnovuji pouze pracovní relaci Sokrata; "
+                "Telegram zůstává spuštěný.",
+            )
+            self._session.restart_pane()
+            # The old rollout can no longer produce an authoritative task_complete event.
+            # Close its routing state explicitly after the pane was successfully replaced.
+            if self._turn_started_wall == token:
+                self._status_clear()
+                self._turn_active.clear()
+                self._turn_from_tg = False
+                self._pending_turn_end = False
+                self._stall_level = 0
+                self._clear_inflight_task()
+                self._write_runtime("idle")
+            self.tg.send_message(chat_id, "✅ Zaseknutá úloha byla ukončena a Sokrates je znovu připraven.")
+        except Exception as e:
+            log.error("cancel escalation failed: %s", e)
+            self._write_runtime("cancel_failed")
+            self.tg.send_message(
+                chat_id,
+                "🔴 Úlohu se nepodařilo bezpečně ukončit ani po eskalaci. "
+                "Agent Smith byl upozorněn.",
+            )
+        finally:
+            with self._cancel_lock:
+                self._cancel_in_progress = False
+                if self._turn_started_wall == token:
+                    self._cancel_requested = False
 
     def _write_runtime(self, state: str | None = None) -> None:
         runtime_path = getattr(self, "_runtime_path", None)
@@ -995,7 +1061,8 @@ class AttachBridge:
         # or interim forwarding missed it), deliver the final assistant message now. The
         # `_turn_text_sent` guard means this only fires when truly nothing was sent (no double-send),
         # and _send_final sets it True so a second _finish_turn won't re-fire.
-        if was_active and self._turn_from_tg and not self._turn_text_sent and self._owner_chat is not None:
+        if (was_active and self._turn_from_tg and not self._turn_text_sent
+                and self._owner_chat is not None and not getattr(self, "_cancel_requested", False)):
             last = self._last_assistant_text()
             out = self._strip_marker(last) if last else ""
             if out:
