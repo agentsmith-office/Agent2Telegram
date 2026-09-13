@@ -154,6 +154,9 @@ class StallDetectionTests(unittest.TestCase):
         bridge._turn_started_wall = int(time.time())
         bridge._stall_level = 0
         bridge._runtime_path = None
+        bridge._cancel_requested = False
+        bridge._cancel_in_progress = False
+        bridge._cancel_lock = threading.Lock()
         bridge.tg = type("Telegram", (), {
             "sent": [],
             "send_message": lambda self, chat, text: self.sent.append((chat, text)),
@@ -171,11 +174,13 @@ class StallDetectionTests(unittest.TestCase):
             self.assertEqual(bridge._stall_level, 1)
 
             bridge._last_activity = now - STALL_CRITICAL
-            bridge._check_stall()
-            bridge._check_stall()
+            with patch("agent2telegram.attach.threading.Thread") as thread:
+                bridge._check_stall()
+                bridge._check_stall()
+                thread.return_value.start.assert_called_once_with()
             self.assertEqual(len(bridge.tg.sent), 2)
             self.assertEqual(bridge._stall_level, 2)
-            self.assertIn("10 minut", bridge.tg.sent[-1][1])
+            self.assertIn("Automaticky", bridge.tg.sent[-1][1])
 
     def test_runtime_state_is_written_without_task_text(self):
         with tempfile.TemporaryDirectory() as td:

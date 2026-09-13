@@ -776,23 +776,9 @@ class AttachBridge:
             if not self._turn_active.is_set():
                 self.tg.send_message(chat_id, "ℹ️ Žádný aktivní úkol není třeba rušit.")
                 return True
-            with self._cancel_lock:
-                if self._cancel_in_progress:
-                    self.tg.send_message(chat_id, "ℹ️ Zrušení už probíhá a ověřuji jeho výsledek.")
-                    return True
-                self._cancel_in_progress = True
-                self._cancel_requested = True
-            self._write_runtime("cancel_requested")
-            self.tg.send_message(
-                chat_id,
-                "🛑 Ruším úkol a ověřuji, že se skutečně zastavil.",
-            )
-            token = self._turn_started_wall
-            threading.Thread(
-                target=self._cancel_worker, args=(chat_id, token),
-                name="a2t-cancel-verifier", daemon=True,
-            ).start()
+            self._begin_cancel(chat_id, automatic=False)
             return True
+
         if cmd == "diag":
             from . import __version__
             session_ok = self._session.alive
@@ -819,6 +805,31 @@ class AttachBridge:
         if cmd == "setkey":
             return self._set_voice_key(arg, chat_id, message_id)
         return False    # unknown command → let the agent handle it
+
+    def _begin_cancel(self, chat_id: int, *, automatic: bool) -> bool:
+        """Start one verified cancellation flow; never report success before verification."""
+        if not self._turn_active.is_set():
+            return False
+        with self._cancel_lock:
+            if self._cancel_in_progress:
+                if not automatic:
+                    self.tg.send_message(chat_id, "ℹ️ Zrušení už probíhá a ověřuji jeho výsledek.")
+                return False
+            self._cancel_in_progress = True
+            self._cancel_requested = True
+        self._write_runtime("cancel_requested")
+        message = (
+            "🛑 Úloha je 10 minut bez aktivity. Automaticky ji ruším a výsledek ověřím."
+            if automatic else
+            "🛑 Ruším úkol a ověřuji, že se skutečně zastavil."
+        )
+        self.tg.send_message(chat_id, message)
+        token = self._turn_started_wall
+        threading.Thread(
+            target=self._cancel_worker, args=(chat_id, token),
+            name="a2t-cancel-verifier", daemon=True,
+        ).start()
+        return True
 
     def _set_voice_key(self, key: str, chat_id: int, message_id: int | None) -> bool:
         """Save an ElevenLabs key to enable voice, then delete the message so the secret isn't
@@ -961,11 +972,7 @@ class AttachBridge:
         if idle >= STALL_CRITICAL and self._stall_level < 2:
             self._stall_level = 2
             self._write_runtime("stalled")
-            self.tg.send_message(
-                self._owner_chat,
-                "🔴 Agent je 10 minut bez nové aktivity. Úloha může být zaseknutá. "
-                "Pošli /cancel; relace nebude automaticky restartována.",
-            )
+            self._begin_cancel(self._owner_chat, automatic=True)
         elif idle >= STALL_WARNING and self._stall_level < 1:
             self._stall_level = 1
             self._write_runtime("stalled_warning")
