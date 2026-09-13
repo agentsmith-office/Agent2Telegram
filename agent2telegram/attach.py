@@ -903,12 +903,12 @@ class AttachBridge:
             self._write_runtime("cancel_escalating")
             self.tg.send_message(
                 chat_id,
-                "⚠️ Běžné přerušení nezabralo. Obnovuji pouze pracovní relaci Sokrata; "
-                "Telegram zůstává spuštěný.",
+                "⚠️ Běžné přerušení nezabralo. Zaseknutou úlohu uzavírám a obnovuji "
+                "pracovní relaci Sokrata.",
             )
-            self._session.restart_pane()
-            # The old rollout can no longer produce an authoritative task_complete event.
-            # Close its routing state explicitly after the pane was successfully replaced.
+            # Close persistent routing BEFORE replacing the pane. Killing the pane may also make
+            # the one-pane tmux session exit, which stops/restarts this bridge via systemd. A new
+            # bridge must never restore the task that the owner explicitly cancelled.
             if self._turn_started_wall == token:
                 self._status_clear()
                 self._turn_active.clear()
@@ -917,7 +917,8 @@ class AttachBridge:
                 self._stall_level = 0
                 self._clear_inflight_task()
                 self._write_runtime("idle")
-            self.tg.send_message(chat_id, "✅ Zaseknutá úloha byla ukončena a Sokrates je znovu připraven.")
+            self._session.restart_pane()
+            self.tg.send_message(chat_id, "✅ Sokrates je znovu připraven.")
         except Exception as e:
             log.error("cancel escalation failed: %s", e)
             self._write_runtime("cancel_failed")

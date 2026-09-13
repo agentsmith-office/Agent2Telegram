@@ -205,12 +205,14 @@ class StallDetectionTests(unittest.TestCase):
         bridge._cancel_in_progress = True
         bridge._cancel_lock = threading.Lock()
         bridge._status_clear = lambda: None
-        bridge._clear_inflight_task = lambda: None
+        events = []
+        bridge._clear_inflight_task = lambda: events.append("cleared")
         bridge._session = type("Session", (), {
             "interrupts": 0,
             "restarts": 0,
             "interrupt": lambda self: setattr(self, "interrupts", self.interrupts + 1),
-            "restart_pane": lambda self: setattr(self, "restarts", self.restarts + 1),
+            "restart_pane": lambda self: (events.append("restarted"),
+                                           setattr(self, "restarts", self.restarts + 1))[-1],
         })()
 
         with patch("agent2telegram.attach.CANCEL_GRACE", 0):
@@ -218,6 +220,7 @@ class StallDetectionTests(unittest.TestCase):
 
         self.assertEqual(bridge._session.interrupts, 2)
         self.assertEqual(bridge._session.restarts, 1)
+        self.assertLess(events.index("cleared"), events.index("restarted"))
         self.assertFalse(bridge._turn_active.is_set())
         self.assertFalse(bridge._cancel_in_progress)
         self.assertIn("znovu připraven", bridge.tg.sent[-1][1])
