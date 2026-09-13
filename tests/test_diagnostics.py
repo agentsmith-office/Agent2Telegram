@@ -28,6 +28,10 @@ class DiagnosticCommandTests(unittest.TestCase):
         self.bridge._pending_send = []
         self.bridge._transcript = Path("rollout-safe.jsonl")
         self.bridge._bridge_started = time.monotonic() - 10
+        self.bridge._stall_level = 0
+        self.bridge._turn_started_wall = 0
+        self.bridge._last_activity_wall = 0
+        self.bridge._runtime_path = None
         self.bridge._auth = AuthState("codex", path=Path("/nonexistent/test-auth-state.json"))
 
     def test_health_reports_runtime_state(self):
@@ -43,6 +47,28 @@ class DiagnosticCommandTests(unittest.TestCase):
         self.assertIn("Agent2Telegram diagnostics", text)
         self.assertIn("rollout-safe.jsonl", text)
         self.assertNotIn("token", text.lower())
+
+    def test_cancel_interrupts_only_an_active_turn(self):
+        interrupted = []
+        self.bridge._session = SimpleNamespace(
+            alive=True, interrupt=lambda: interrupted.append(True)
+        )
+        self.bridge._turn_active.set()
+
+        self.assertTrue(self.bridge._handle_command("/cancel", 7))
+
+        self.assertEqual(interrupted, [True])
+        self.assertTrue(self.bridge._turn_active.is_set())
+        self.assertIn("Požadavek na zrušení", self.bridge.tg.sent[-1][1])
+
+    def test_cancel_is_a_noop_when_idle(self):
+        self.bridge._session = SimpleNamespace(
+            alive=True, interrupt=lambda: self.fail("idle session was interrupted")
+        )
+
+        self.assertTrue(self.bridge._handle_command("/cancel", 7))
+
+        self.assertIn("Žádný aktivní úkol", self.bridge.tg.sent[-1][1])
 
 
 if __name__ == "__main__":

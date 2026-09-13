@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from agent2telegram.attach import AttachBridge, _empty_turn_notice
+from agent2telegram.attach import AttachBridge, STALL_CRITICAL, STALL_WARNING, _empty_turn_notice
 from agent2telegram.readers import CodexReader
 from agent2telegram.session import TmuxSession
 
@@ -79,6 +79,15 @@ class TurnBackstopTests(unittest.TestCase):
 
 
 class LongMessageInjectionTests(unittest.TestCase):
+    def test_interrupt_sends_ctrl_c_without_killing_session(self):
+        session = object.__new__(TmuxSession)
+        session.name = "test-session"
+        with patch.object(session, "_exists", return_value=True), \
+             patch("agent2telegram.session._tmux") as tmux:
+            session.interrupt()
+
+        tmux.assert_called_once_with("send-keys", "-t", "test-session", "C-c")
+
     def test_long_message_waits_for_tui_before_pressing_enter(self):
         session = object.__new__(TmuxSession)
         session.name = "test-session"
@@ -117,6 +126,53 @@ class LongMessageInjectionTests(unittest.TestCase):
 
         self.assertTrue(bridge._session.retried)
 
+
+class StallDetectionTests(unittest.TestCase):
+    def _bridge(self):
+        bridge = object.__new__(AttachBridge)
+        bridge._turn_active = threading.Event()
+        bridge._turn_active.set()
+        bridge._owner_chat = 42
+        bridge._last_activity = time.monotonic()
+        bridge._last_activity_wall = int(time.time())
+        bridge._turn_started_wall = int(time.time())
+        bridge._stall_level = 0
+        bridge._runtime_path = None
+        bridge.tg = type("Telegram", (), {
+            "sent": [],
+            "send_message": lambda self, chat, text: self.sent.append((chat, text)),
+        })()
+        return bridge
+
+    def test_warns_once_at_five_minutes_and_marks_critical_at_ten(self):
+        bridge = self._bridge()
+        now = time.monotonic()
+        with patch("agent2telegram.attach.time.monotonic", return_value=now):
+            bridge._last_activity = now - STALL_WARNING
+            bridge._check_stall()
+            bridge._check_stall()
+            self.assertEqual(len(bridge.tg.sent), 1)
+            self.assertEqual(bridge._stall_level, 1)
+
+            bridge._last_activity = now - STALL_CRITICAL
+            bridge._check_stall()
+            bridge._check_stall()
+            self.assertEqual(len(bridge.tg.sent), 2)
+            self.assertEqual(bridge._stall_level, 2)
+            self.assertIn("10 minut", bridge.tg.sent[-1][1])
+
+    def test_runtime_state_is_written_without_task_text(self):
+        with tempfile.TemporaryDirectory() as td:
+            bridge = self._bridge()
+            bridge.cfg = type("Cfg", (), {"tmux_session": "sokrates"})()
+            bridge._runtime_path = Path(td) / "runtime_sokrates.json"
+            bridge._write_runtime("stalled")
+
+            state = __import__("json").loads(bridge._runtime_path.read_text("utf-8"))
+            self.assertEqual(state["state"], "stalled")
+            self.assertEqual(state["agent"], "sokrates")
+            self.assertNotIn("text", state)
+            self.assertEqual(bridge._runtime_path.stat().st_mode & 0o777, 0o600)
 
 class RebootContinuityTests(unittest.TestCase):
     def _bridge(self, root: Path):

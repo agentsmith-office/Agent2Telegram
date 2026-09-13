@@ -139,6 +139,12 @@ class TmuxSession:
             raise SessionError(f"agent session '{self.name}' is gone")
         _tmux("send-keys", "-t", self.name, "Enter")
 
+    def interrupt(self) -> None:
+        """Request cancellation of the foreground turn without killing the session."""
+        if not self.alive:
+            raise SessionError(f"agent session '{self.name}' is gone")
+        _tmux("send-keys", "-t", self.name, "C-c")
+
     def send(self, text: str) -> str:
         if not self.alive:
             raise SessionError(f"agent session '{self.name}' is gone")

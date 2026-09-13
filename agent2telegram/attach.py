@@ -20,6 +20,7 @@ import json
 import logging
 import os
 import subprocess
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -36,6 +37,8 @@ log = logging.getLogger("agent2telegram.attach")
 #: the Stop-hook turn-end marker never arrives. The marker is the primary, precise signal —
 #: this just stops "typing…" from hanging forever if the hook is missing/misconfigured.
 IDLE_DONE = 90.0
+STALL_WARNING = 5 * 60.0
+STALL_CRITICAL = 10 * 60.0
 #: How often we re-assert the "typing…" chat action (Telegram shows it for ~5s). Kept well
 #: under that window so a turn never shows a gap, even right after a sent message clears it.
 TYPING_INTERVAL = 1.5
@@ -54,6 +57,7 @@ BOT_COMMANDS = [
     {"command": "health", "description": "Quick bridge and session health"},
     {"command": "diag", "description": "Safe diagnostics for the owner"},
     {"command": "agents", "description": "All agents health and recovery status"},
+    {"command": "cancel", "description": "Cancel the current task safely"},
     {"command": "setkey", "description": "Enable voice (your ElevenLabs API key)"},
     {"command": "id", "description": "Show your Telegram id"},
 ]
@@ -213,6 +217,10 @@ class AttachBridge:
         self._turn_text_sent = False         # has any text been forwarded this turn (bubble gate)
         self._bridge_started = time.monotonic()
         self._idle_warned = False
+        self._stall_level = 0
+        self._turn_started_wall = 0
+        self._last_activity_wall = 0
+        self._runtime_path = (self._signal.parent / f"runtime_{_slug}.json") if self._signal else None
 
     # ---- transcript resolution --------------------------------------------
     def _codex_sessions_dir(self) -> Path:
@@ -361,6 +369,7 @@ class AttachBridge:
         log.info("BRIDGE_STARTED bot=@%s tmux=%s owner=%s agent=%s",
                  me.get("username"), self.cfg.tmux_session, self._owner_chat, self.cfg.agent)
         self.tg.set_my_commands(BOT_COMMANDS)    # enable the "/" command menu in Telegram
+        self._write_runtime("idle")
         if not self._session.alive:
             raise RuntimeError(f"tmux session '{self.cfg.tmux_session}' not found")
         blocked = _blocking_session_prompt(self._session._capture())
@@ -498,6 +507,10 @@ class AttachBridge:
         self._turn_active.set()
         self._turn_from_tg = True
         self._last_activity = time.monotonic()
+        self._turn_started_wall = int(task.get("accepted_at") or time.time())
+        self._last_activity_wall = int(time.time())
+        self._stall_level = 0
+        self._write_runtime("working")
         current_boot = self._boot_id()
         if task.get("accepted_boot_id") == current_boot or task.get("resumed_boot_id") == current_boot:
             log.info("TASK_RESTORE mode=same_boot action=follow_existing_turn")
@@ -654,11 +667,15 @@ class AttachBridge:
         self._turn_active.set()
         self._last_activity = now
         self._turn_started = now
+        self._turn_started_wall = int(time.time())
+        self._last_activity_wall = self._turn_started_wall
         self._typing_count = 1
         self._max_gap = 0.0
         self._last_typing = now
         self._turn_text_sent = False             # gate TUI bubbles until intro text lands
         self._idle_warned = False
+        self._stall_level = 0
+        self._write_runtime("working")
         # Seed the TUI dedup with tool lines ALREADY on screen from previous turns, so the
         # scraper only emits calls that appear DURING this turn — otherwise stale lines still
         # visible in the pane get re-sent as bubbles under the new turn.
@@ -723,7 +740,7 @@ class AttachBridge:
                 "progress, what tools it runs, and the reply. You can also send *photos* and "
                 "*files*, and react with ❤️ as quick feedback.\n\n"
                 f"🎤 Voice transcription: {voice}.\n\n"
-                "Commands: /help · /status · /health · /diag · /agents · /id · /setkey")
+                "Commands: /help · /status · /health · /diag · /agents · /cancel · /id · /setkey")
             return True
         if cmd == "id":
             self.tg.send_message(chat_id, f"Your Telegram id: `{chat_id}`")
@@ -736,7 +753,7 @@ class AttachBridge:
             return True
         if cmd == "health":
             session_ok = self._session.alive
-            state = "working" if self._turn_active.is_set() else "idle"
+            state = self._runtime_state()
             pending = len(self._pending_send)
             auth_ok = self._auth.status != "login_required"
             icon = "✅" if session_ok and pending == 0 and auth_ok else "⚠️"
@@ -747,6 +764,22 @@ class AttachBridge:
                 f"turn: {state}\n"
                 f"outbound queue: {pending}\n"
                 f"{self._auth.health_line()}",
+            )
+            return True
+        if cmd == "cancel":
+            if not self._turn_active.is_set():
+                self.tg.send_message(chat_id, "ℹ️ Žádný aktivní úkol není třeba rušit.")
+                return True
+            try:
+                self._session.interrupt()
+            except Exception as e:
+                log.error("cancel failed: %s", e)
+                self.tg.send_message(chat_id, "⚠️ Úkol se nepodařilo přerušit; relace zůstala beze změny.")
+                return True
+            self._write_runtime("cancel_requested")
+            self.tg.send_message(
+                chat_id,
+                "🛑 Požadavek na zrušení úkolu byl odeslán. Relaci ani Telegram nerestartuji.",
             )
             return True
         if cmd == "diag":
@@ -762,7 +795,7 @@ class AttachBridge:
                 f"agent: `{self.cfg.agent}`",
                 f"tmux: `{self.cfg.tmux_session}` ({'running' if session_ok else 'missing'})",
                 f"transcript: `{transcript}`",
-                f"turn active: `{self._turn_active.is_set()}`",
+                f"turn: `{self._runtime_state()}`",
                 f"queued replies: `{len(self._pending_send)}`",
                 *self._auth.diag_lines(),
             ]
@@ -814,6 +847,67 @@ class AttachBridge:
                 self._last_typing = now
                 self._typing_count += 1
             self._stop.wait(TYPING_INTERVAL)
+
+    def _runtime_state(self) -> str:
+        if not self._turn_active.is_set():
+            return "idle"
+        return {1: "stalled_warning", 2: "stalled"}.get(
+            getattr(self, "_stall_level", 0), "working"
+        )
+
+    def _write_runtime(self, state: str | None = None) -> None:
+        runtime_path = getattr(self, "_runtime_path", None)
+        if runtime_path is None:
+            return
+        value = {
+            "schema": 1,
+            "agent": self.cfg.tmux_session,
+            "state": state or self._runtime_state(),
+            "updated_at": int(time.time()),
+            "turn_started_at": getattr(self, "_turn_started_wall", 0) or None,
+            "last_activity_at": getattr(self, "_last_activity_wall", 0) or None,
+        }
+        tmp = None
+        try:
+            runtime_path.parent.mkdir(parents=True, exist_ok=True)
+            fd, name = tempfile.mkstemp(prefix=runtime_path.name + ".", dir=runtime_path.parent)
+            tmp = Path(name)
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(value, handle, ensure_ascii=False)
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, runtime_path)
+        except OSError as e:
+            log.warning("runtime state write failed: %s", e)
+        finally:
+            if tmp is not None:
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
+
+    def _check_stall(self) -> None:
+        if not self._turn_active.is_set() or self._owner_chat is None:
+            return
+        idle = time.monotonic() - self._last_activity
+        if idle >= STALL_CRITICAL and self._stall_level < 2:
+            self._stall_level = 2
+            self._write_runtime("stalled")
+            self.tg.send_message(
+                self._owner_chat,
+                "🔴 Agent je 10 minut bez nové aktivity. Úloha může být zaseknutá. "
+                "Pošli /cancel; relace nebude automaticky restartována.",
+            )
+        elif idle >= STALL_WARNING and self._stall_level < 1:
+            self._stall_level = 1
+            self._write_runtime("stalled_warning")
+            self.tg.send_message(
+                self._owner_chat,
+                "🟡 Agent je 5 minut bez nové aktivity. Může stále pracovat; pokud úloha "
+                "zjevně stojí, pošli /cancel.",
+            )
 
     def _tui_scrape_loop(self) -> None:
         """Codex only: scrape the tmux pane for live tool/web-search lines → status bubbles, so
@@ -919,6 +1013,8 @@ class AttachBridge:
                 self._send_final(notice)
                 log.warning("TURN END no_agent_answer reason=%s action=notify_owner", reason)
         self._turn_active.clear()
+        self._stall_level = 0
+        self._write_runtime("idle")
         self._pending_turn_end = False
         self._consume_turn_end()
         if was_active:
@@ -961,6 +1057,7 @@ class AttachBridge:
                     else:
                         log.warning("TURN_END_FALLBACK reason=idle_timeout idle=%.1fs", IDLE_DONE)
                         self._finish_turn()
+                self._check_stall()
                 self._beat()                  # reached only on a full, non-blocking forward cycle
             except Exception as e:
                 log.error("outbound error: %s", e)
@@ -1072,6 +1169,10 @@ class AttachBridge:
         # refresh activity so the idle fallback doesn't fire prematurely.
         if self._turn_from_tg:
             self._last_activity = time.monotonic()
+            self._last_activity_wall = int(time.time())
+            if self._stall_level:
+                self._stall_level = 0
+            self._write_runtime("working")
 
     def _strip_marker(self, text: str) -> str:
         """Remove the progress marker (e.g. ``[TG]``) from the start of *any* line. It's a routing
