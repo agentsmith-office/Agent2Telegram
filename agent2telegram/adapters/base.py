@@ -14,12 +14,19 @@ Robustness choices:
 """
 from __future__ import annotations
 
+import os
+import signal
 import shutil
 import subprocess
+import threading
 from pathlib import Path
 
 
 class AdapterError(Exception):
+    pass
+
+
+class TaskCancelled(AdapterError):
     pass
 
 
@@ -51,6 +58,9 @@ class Adapter:
         self._command = command or self.default_command
         self._continue = continue_command or self.continue_command or self._command
         self._timeout = timeout
+        self._active: dict[str, subprocess.Popen] = {}
+        self._cancelled: set[int] = set()
+        self._active_lock = threading.Lock()
 
     # ---- discovery ---------------------------------------------------------
     @classmethod
@@ -66,28 +76,76 @@ class Adapter:
     def run(self, prompt: str, *, chat_dir: Path, is_continuation: bool) -> str:
         chat_dir.mkdir(parents=True, exist_ok=True)
         argv = self.build_argv(prompt, is_continuation=is_continuation)
+        key = str(chat_dir.resolve())
+        proc = None
         try:
-            proc = subprocess.run(
-                argv,
-                cwd=str(chat_dir),
-                capture_output=True,
-                text=True,
-                timeout=self._timeout,
-                check=False,
-                stdin=subprocess.DEVNULL,   # some CLIs read stdin; give them immediate EOF
+            proc = subprocess.Popen(
+                argv, cwd=str(chat_dir), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, stdin=subprocess.DEVNULL, start_new_session=True,
             )
+            with self._active_lock:
+                self._active[key] = proc
+            try:
+                stdout, stderr = proc.communicate(timeout=self._timeout)
+            except subprocess.TimeoutExpired as e:
+                self._terminate_group(proc)
+                raise AdapterError(
+                    f"{self.label or self.name} timed out after {self._timeout}s."
+                ) from e
         except FileNotFoundError as e:
             raise AdapterError(
                 f"'{self.binary}' not found. Is {self.label or self.name} installed and on PATH?"
             ) from e
-        except subprocess.TimeoutExpired as e:
-            raise AdapterError(f"{self.label or self.name} timed out after {self._timeout}s.") from e
+        finally:
+            if proc is not None:
+                with self._active_lock:
+                    self._active.pop(key, None)
 
-        out = (proc.stdout or "").strip()
+        with self._active_lock:
+            was_cancelled = proc.pid in self._cancelled
+            self._cancelled.discard(proc.pid)
+        if was_cancelled:
+            raise TaskCancelled(f"{self.label or self.name} task was cancelled.")
+        out = (stdout or "").strip()
         if proc.returncode != 0 and not out:
-            err = (proc.stderr or "").strip() or f"exit code {proc.returncode}"
+            err = (stderr or "").strip() or f"exit code {proc.returncode}"
             raise AdapterError(f"{self.label or self.name} failed: {err[:500]}")
         return self.parse_output(out)
+
+    @staticmethod
+    def _terminate_group(proc: subprocess.Popen, grace: float = 3.0) -> None:
+        if proc.poll() is not None:
+            return
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+            proc.wait(timeout=grace)
+        except (ProcessLookupError, subprocess.TimeoutExpired):
+            if proc.poll() is None:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                try:
+                    proc.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    pass
+
+    def cancel(self, *, chat_dir: Path) -> bool:
+        """Terminate and reap the exact process group running for one chat."""
+        key = str(chat_dir.resolve())
+        with self._active_lock:
+            proc = self._active.get(key)
+            if proc is None or proc.poll() is not None:
+                return False
+            self._cancelled.add(proc.pid)
+        self._terminate_group(proc)
+        return proc.poll() is not None
+
+    def is_active(self, *, chat_dir: Path) -> bool:
+        key = str(chat_dir.resolve())
+        with self._active_lock:
+            proc = self._active.get(key)
+            return proc is not None and proc.poll() is None
 
     def parse_output(self, stdout: str) -> str:
         """Hook for adapters whose CLI emits structured output. Default: raw text."""

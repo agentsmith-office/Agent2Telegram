@@ -39,6 +39,12 @@ class _FakeAdapter:
         self.calls.append({"prompt": prompt, "is_continuation": is_continuation})
         return f"echo: {prompt}"
 
+    def cancel(self, *, chat_dir):
+        return False
+
+    def is_active(self, *, chat_dir):
+        return False
+
 
 class BridgeTestBase(unittest.TestCase):
     def setUp(self):
@@ -77,6 +83,12 @@ class ContinuityTests(BridgeTestBase):
         self.bridge.process(2, Task(text="b"))
         self.assertFalse(self.adapter.calls[0]["is_continuation"])
         self.assertFalse(self.adapter.calls[1]["is_continuation"])
+
+    def test_cancel_reports_only_verified_result(self):
+        self.adapter.cancel = lambda **_kwargs: True
+        handled = self.bridge._handle_command(100, 7, "/cancel")
+        self.assertTrue(handled)
+        self.assertIn("skutečně ukončena", self.sent_texts()[-1])
 
 
 class AuthTests(BridgeTestBase):

@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from . import __version__, adapters
+from .adapters.base import TaskCancelled
 from .auth import AUTH_REQUIRED_NOTICE, AuthState, classify_auth_error
 from .config import Config, _state_dir
 from .telegram import TelegramClient
@@ -42,6 +43,7 @@ _HELP = (
     "Commands:\n"
     "/id — show your Telegram IDs (for the allow-list)\n"
     "/reset — start a fresh conversation\n"
+    "/cancel — stop and verify the active task\n"
     "/status — bridge status\n"
     "/help — this help"
 )
@@ -233,9 +235,12 @@ class Bridge:
             return True
         if cmd == "health":
             degraded = self._auth.status == "login_required"
+            active = self.adapter.is_active(chat_dir=self.chat_dir(chat_id))
             self.tg.send_message(
                 chat_id,
                 f"{'⚠️' if degraded else '✅'} Bridge: running\n"
+                "mode: managed exec\n"
+                f"turn: {'working' if active else 'idle'}\n"
                 f"agent: {self.cfg.agent}\n{self._auth.health_line()}",
             )
             return True
@@ -253,6 +258,14 @@ class Bridge:
                 return True
             from .monitoring import telegram_status
             self.tg.send_message(chat_id, telegram_status())
+            return True
+        if cmd == "cancel":
+            if user_id not in self._allowed:
+                return True
+            if self.adapter.cancel(chat_dir=self.chat_dir(chat_id)):
+                self.tg.send_message(chat_id, "✅ Úloha byla skutečně ukončena.")
+            else:
+                self.tg.send_message(chat_id, "ℹ️ Žádný aktivní úkol není třeba rušit.")
             return True
         if cmd == "reset":
             if user_id in self._allowed:
@@ -297,6 +310,9 @@ class Bridge:
         with self._keep_typing(chat_id):
             try:
                 reply = self.adapter.run(prompt, chat_dir=chat_dir, is_continuation=is_cont)
+            except TaskCancelled:
+                log.info("agent task cancelled for chat %s", chat_id)
+                return
             except Exception as e:
                 log.error("agent run failed for chat %s: %s", chat_id, e)
                 if classify_auth_error(str(e)):

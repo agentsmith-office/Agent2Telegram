@@ -36,7 +36,7 @@ class Config:
     poll_timeout: int = 50              # long-poll timeout for getUpdates
     elevenlabs_api_key: str = ""        # optional: enables voice-message transcription (STT)
     # ---- persistent "attach" mode (drive an existing live agent session) ----
-    mode: str = "oneshot"               # "oneshot" | "attach"
+    mode: str = "oneshot"               # "oneshot" | "stream" | "attach"
     tmux_session: str = ""              # name of the existing tmux session to drive
     signal_file: str = ""               # where the Stop hook writes the final answer
     transcript_path: str = ""           # agent transcript to tail for interim updates

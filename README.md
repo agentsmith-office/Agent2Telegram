@@ -137,10 +137,15 @@ from Telegram.
 | `/start`, `/help` | short intro + what you can send |
 | `/status` | which agent + tmux session you're connected to (and whether voice is on) |
 | `/health`, `/diag` | safe runtime and connection diagnostics |
-| `/cancel` | cancel and verify the active turn; retry, then restart only the agent pane if needed |
+| `/cancel` | cancel and verify the active turn; managed mode terminates its exact process group |
 
 Attach mode starts the same verified cancellation automatically after ten minutes without
 transcript activity, so an interactive command cannot block an agent indefinitely.
+
+For unattended production agents, managed (one-shot) mode is safer than attach mode: every
+message runs as its own `codex exec` process with stdin closed, a hard timeout, and a directly
+verifiable `/cancel`. Attach mode remains available when preserving an interactive TUI is more
+important than process-level isolation.
 | `/setkey <key>` | enable voice transcription with your ElevenLabs key — your message is deleted right after so the key isn't left in the chat |
 | `/id` | show your user / chat id (handy for the allow‑list) |
 

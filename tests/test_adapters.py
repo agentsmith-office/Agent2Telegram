@@ -1,5 +1,9 @@
 """Tests for the agent adapters (argv building, registry, overrides)."""
+import tempfile
+import threading
+import time
 import unittest
+from pathlib import Path
 
 from agent2telegram import adapters
 from agent2telegram.adapters import AdapterError, build
@@ -61,6 +65,41 @@ class RegistryTests(unittest.TestCase):
         a = build(cfg)
         argv = a.build_argv("x", is_continuation=False)
         self.assertIn("--model", argv)
+
+
+class ManagedProcessTests(unittest.TestCase):
+    def test_stdin_is_immediate_eof(self):
+        with tempfile.TemporaryDirectory() as td:
+            a = adapters.GenericAdapter(
+                command=["python3", "-c", "import sys; print(len(sys.stdin.read()))"], timeout=5
+            )
+            self.assertEqual(a.run("ignored", chat_dir=Path(td), is_continuation=False), "0")
+
+    def test_cancel_terminates_and_reaps_exact_chat_process(self):
+        with tempfile.TemporaryDirectory() as td:
+            chat = Path(td)
+            a = adapters.GenericAdapter(
+                command=["python3", "-c", "import time; time.sleep(60)"], timeout=65
+            )
+            result = []
+
+            def run():
+                try:
+                    a.run("ignored", chat_dir=chat, is_continuation=False)
+                except Exception as exc:
+                    result.append(type(exc).__name__)
+
+            worker = threading.Thread(target=run)
+            worker.start()
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline:
+                if a.cancel(chat_dir=chat):
+                    break
+                time.sleep(0.02)
+            worker.join(timeout=3)
+
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(result, ["TaskCancelled"])
 
 
 class TuiLaunchTests(unittest.TestCase):
