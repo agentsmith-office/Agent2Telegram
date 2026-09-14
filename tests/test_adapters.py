@@ -1,5 +1,7 @@
 """Tests for the agent adapters (argv building, registry, overrides)."""
 import tempfile
+import os
+import subprocess
 import threading
 import time
 import unittest
@@ -100,6 +102,49 @@ class ManagedProcessTests(unittest.TestCase):
 
             self.assertFalse(worker.is_alive())
             self.assertEqual(result, ["TaskCancelled"])
+
+    def test_sigkill_escalation_reaps_process_ignoring_sigterm(self):
+        proc = subprocess.Popen(
+            ["python3", "-c", "import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, start_new_session=True,
+        )
+        time.sleep(0.05)
+        adapters.GenericAdapter._terminate_group(proc, grace=0.05)
+        proc.communicate(timeout=1)
+        self.assertIsNotNone(proc.returncode)
+        with self.assertRaises(ProcessLookupError):
+            os.kill(proc.pid, 0)
+
+    def test_two_chat_processes_are_isolated(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            chat_a, chat_b = root / "a", root / "b"
+            a = adapters.GenericAdapter(
+                command=["python3", "-c", "import time; time.sleep(60)"], timeout=65
+            )
+            outcomes = []
+
+            def run(chat):
+                try:
+                    a.run("ignored", chat_dir=chat, is_continuation=False)
+                except Exception as exc:
+                    outcomes.append((chat.name, type(exc).__name__))
+
+            threads = [threading.Thread(target=run, args=(chat,)) for chat in (chat_a, chat_b)]
+            for thread in threads:
+                thread.start()
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline:
+                if a.is_active(chat_dir=chat_a) and a.is_active(chat_dir=chat_b):
+                    break
+                time.sleep(0.02)
+            self.assertTrue(a.cancel(chat_dir=chat_a))
+            self.assertTrue(a.is_active(chat_dir=chat_b))
+            self.assertTrue(a.cancel(chat_dir=chat_b))
+            for thread in threads:
+                thread.join(timeout=3)
+            self.assertCountEqual(outcomes, [("a", "TaskCancelled"), ("b", "TaskCancelled")])
 
 
 class TuiLaunchTests(unittest.TestCase):

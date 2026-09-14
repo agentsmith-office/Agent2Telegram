@@ -98,6 +98,13 @@ class AuthTests(BridgeTestBase):
         self.assertEqual(self.adapter.calls, [])
         self.assertTrue(any("not authorized" in t.lower() for t in self.sent_texts()))
 
+    def test_unauthorized_cancel_cannot_reach_adapter(self):
+        called = []
+        self.adapter.cancel = lambda **_kwargs: called.append(True) or True
+        self.bridge._dispatch({"update_id": 2, "message": {
+            "chat": {"id": 100}, "from": {"id": 999}, "text": "/cancel"}})
+        self.assertEqual(called, [])
+
 
 class AttachmentTests(BridgeTestBase):
     def test_image_is_downloaded_and_attached(self):

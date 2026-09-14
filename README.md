@@ -144,7 +144,8 @@ transcript activity, so an interactive command cannot block an agent indefinitel
 
 For unattended production agents, managed (one-shot) mode is safer than attach mode: every
 message runs as its own `codex exec` process with stdin closed, a hard timeout, and a directly
-verifiable `/cancel`. Attach mode remains available when preserving an interactive TUI is more
+verifiable `/cancel`. Cancellation sends `SIGTERM`, waits three seconds, then sends `SIGKILL` to
+the isolated process group and reaps it if necessary. Attach mode remains available when preserving an interactive TUI is more
 important than process-level isolation.
 | `/setkey <key>` | enable voice transcription with your ElevenLabs key — your message is deleted right after so the key isn't left in the chat |
 | `/id` | show your user / chat id (handy for the allow‑list) |
