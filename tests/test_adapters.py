@@ -146,6 +146,38 @@ class ManagedProcessTests(unittest.TestCase):
                 thread.join(timeout=3)
             self.assertCountEqual(outcomes, [("a", "TaskCancelled"), ("b", "TaskCancelled")])
 
+    def test_cancel_removes_child_in_separate_process_group_same_session(self):
+        with tempfile.TemporaryDirectory() as td:
+            chat = Path(td)
+            pid_file = chat / "child.pid"
+            code = (
+                "import os,pathlib,subprocess,time; "
+                "p=subprocess.Popen(['sleep','60'], preexec_fn=os.setpgrp); "
+                f"pathlib.Path({str(pid_file)!r}).write_text(str(p.pid)); "
+                "time.sleep(60)"
+            )
+            a = adapters.GenericAdapter(command=["python3", "-c", code], timeout=65)
+            result = []
+
+            def run():
+                try:
+                    a.run("ignored", chat_dir=chat, is_continuation=False)
+                except Exception as exc:
+                    result.append(type(exc).__name__)
+
+            worker = threading.Thread(target=run)
+            worker.start()
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline and not pid_file.exists():
+                time.sleep(0.02)
+            child_pid = int(pid_file.read_text("utf-8"))
+            self.assertTrue(a.cancel(chat_dir=chat))
+            worker.join(timeout=3)
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(result, ["TaskCancelled"])
+            with self.assertRaises(ProcessLookupError):
+                os.kill(child_pid, 0)
+
 
 class TuiLaunchTests(unittest.TestCase):
     """The wizard launches the interactive TUI with the autonomous flag, so the bridge can drive

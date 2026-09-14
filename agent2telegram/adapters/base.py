@@ -19,6 +19,7 @@ import signal
 import shutil
 import subprocess
 import threading
+import time
 from pathlib import Path
 
 
@@ -113,22 +114,53 @@ class Adapter:
         return self.parse_output(out)
 
     @staticmethod
-    def _terminate_group(proc: subprocess.Popen, grace: float = 3.0) -> None:
-        if proc.poll() is not None:
-            return
+    def _session_pids(session_id: int) -> list[int]:
+        """Return same-UID processes in an OS session, including their separate process groups."""
+        found = []
+        uid = os.getuid()
+        for entry in Path("/proc").iterdir():
+            if not entry.name.isdigit():
+                continue
+            try:
+                if entry.stat().st_uid != uid:
+                    continue
+                raw = (entry / "stat").read_text("utf-8")
+                # comm can contain spaces/parentheses; fields after its final ')' start at state.
+                fields = raw[raw.rfind(")") + 2:].split()
+                if len(fields) > 3 and fields[0] != "Z" and int(fields[3]) == session_id:
+                    found.append(int(entry.name))
+            except (OSError, ValueError):
+                continue
+        return found
+
+    @classmethod
+    def _signal_session(cls, session_id: int, sig: int) -> None:
+        # Descendants first, leader last: stop useful work before asking the supervising CLI to exit.
+        for pid in sorted(cls._session_pids(session_id), key=lambda p: p == session_id):
+            try:
+                os.kill(pid, sig)
+            except ProcessLookupError:
+                pass
+
+    @classmethod
+    def _terminate_group(cls, proc: subprocess.Popen, grace: float = 3.0) -> None:
+        """Terminate every same-UID process in the task's isolated OS session and reap its leader."""
+        session_id = proc.pid                 # start_new_session=True makes the leader its SID
+        cls._signal_session(session_id, signal.SIGTERM)
+        deadline = time.monotonic() + grace
+        while time.monotonic() < deadline and cls._session_pids(session_id):
+            proc.poll()
+            time.sleep(0.05)
+        remaining = cls._session_pids(session_id)
+        if remaining:
+            cls._signal_session(session_id, signal.SIGKILL)
         try:
-            os.killpg(proc.pid, signal.SIGTERM)
-            proc.wait(timeout=grace)
-        except (ProcessLookupError, subprocess.TimeoutExpired):
-            if proc.poll() is None:
-                try:
-                    os.killpg(proc.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                try:
-                    proc.wait(timeout=2)
-                except subprocess.TimeoutExpired:
-                    pass
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            pass
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and cls._session_pids(session_id):
+            time.sleep(0.05)
 
     def cancel(self, *, chat_dir: Path) -> bool:
         """Terminate and reap the exact process group running for one chat."""
@@ -139,7 +171,7 @@ class Adapter:
                 return False
             self._cancelled.add(proc.pid)
         self._terminate_group(proc)
-        return proc.poll() is not None
+        return proc.poll() is not None and not self._session_pids(proc.pid)
 
     def is_active(self, *, chat_dir: Path) -> bool:
         key = str(chat_dir.resolve())
