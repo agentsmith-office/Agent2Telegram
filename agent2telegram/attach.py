@@ -635,6 +635,7 @@ class AttachBridge:
                     log.exception("inbound error: %s", e)
 
     def _handle(self, upd: dict) -> None:
+        from .chat_context import acknowledge_proactive, enrich_inbound
         # Reactions (e.g. ❤️) → quick-feedback line.
         mr = upd.get("message_reaction")
         if mr:
@@ -704,6 +705,7 @@ class AttachBridge:
             note = self._download_note(msg, chat_id)
             text = f"{text}\n{note}".strip() if note else text
         if text:
+            text, proactive_cursor = enrich_inbound(msg, text)
             try:
                 self._persist_inflight_task(text, message_id=msg.get("message_id"))
             except Exception as e:
@@ -711,6 +713,9 @@ class AttachBridge:
                 self._turn_active.clear()
                 self.tg.send_message(chat_id, "⚠️ Úkol se nepodařilo bezpečně uložit; nebyl spuštěn.")
                 return
+            # The enriched task is durable now. Advancing only after that point prevents a
+            # bridge crash from silently losing notification context.
+            acknowledge_proactive(chat_id, proactive_cursor)
             self._inject(text)
 
     def _inject(self, text: str) -> None:

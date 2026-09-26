@@ -79,8 +79,11 @@ def _cmd_notify(args) -> int:
         print("✗ no owner to notify (allowed_user_ids is empty)", file=sys.stderr)
         return 2
     from .telegram import TelegramClient, TelegramError
+    from .chat_context import record_proactive
     try:
-        TelegramClient(cfg.token).send_message(cfg.allowed_user_ids[0], text)
+        chat_id = cfg.allowed_user_ids[0]
+        message_ids = TelegramClient(cfg.token).send_message(chat_id, text)
+        record_proactive(chat_id, text, message_ids)
     except TelegramError as e:
         print(f"✗ send failed: {e}", file=sys.stderr)
         return 1
