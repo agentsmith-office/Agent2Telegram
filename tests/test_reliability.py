@@ -163,7 +163,7 @@ class StallDetectionTests(unittest.TestCase):
         })()
         return bridge
 
-    def test_warns_once_at_five_minutes_and_marks_critical_at_ten(self):
+    def test_warns_once_at_five_minutes_and_never_auto_cancels_at_ten(self):
         bridge = self._bridge()
         now = time.monotonic()
         with patch("agent2telegram.attach.time.monotonic", return_value=now):
@@ -174,13 +174,14 @@ class StallDetectionTests(unittest.TestCase):
             self.assertEqual(bridge._stall_level, 1)
 
             bridge._last_activity = now - STALL_CRITICAL
-            with patch("agent2telegram.attach.threading.Thread") as thread:
+            with patch.object(bridge, "_begin_cancel") as cancel:
                 bridge._check_stall()
                 bridge._check_stall()
-                thread.return_value.start.assert_called_once_with()
+                cancel.assert_not_called()
             self.assertEqual(len(bridge.tg.sent), 2)
             self.assertEqual(bridge._stall_level, 2)
-            self.assertIn("Automaticky", bridge.tg.sent[-1][1])
+            self.assertIn("automaticky neruším", bridge.tg.sent[-1][1])
+            self.assertTrue(bridge._turn_active.is_set())
 
     def test_runtime_state_is_written_without_task_text(self):
         with tempfile.TemporaryDirectory() as td:

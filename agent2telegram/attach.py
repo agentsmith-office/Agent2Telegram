@@ -978,7 +978,16 @@ class AttachBridge:
         if idle >= STALL_CRITICAL and self._stall_level < 2:
             self._stall_level = 2
             self._write_runtime("stalled")
-            self._begin_cancel(self._owner_chat, automatic=True)
+            # Transcript silence is not proof that the agent is stuck. Long-running web/video
+            # work can legitimately produce no rollout events for many minutes. Automatically
+            # interrupting here used to destroy such work and, after escalation, replace the tmux
+            # pane and clear the durable in-flight task. Keep the task alive and let the owner
+            # decide whether to cancel it explicitly.
+            self.tg.send_message(
+                self._owner_chat,
+                "🔴 Agent je 10 minut bez nové aktivity. Úkol automaticky neruším; "
+                "pokud zjevně stojí, pošli /cancel.",
+            )
         elif idle >= STALL_WARNING and self._stall_level < 1:
             self._stall_level = 1
             self._write_runtime("stalled_warning")
