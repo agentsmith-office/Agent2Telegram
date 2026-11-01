@@ -11,9 +11,16 @@ from agent2telegram.chat_context import (
     pending_proactive,
     record_proactive,
 )
+from agent2telegram.__main__ import _record_proactive_best_effort
 
 
 class ProactiveContextTests(unittest.TestCase):
+    def test_confirmed_delivery_survives_any_context_recorder_failure(self):
+        def fail(*_args):
+            raise RuntimeError("sandbox denied context lock")
+
+        _record_proactive_best_effort(fail, 42, "sent", [100])
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.env = patch.dict(os.environ, {"AGENT2TELEGRAM_STATE": self.tmp.name})

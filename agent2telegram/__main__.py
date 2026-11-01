@@ -13,6 +13,9 @@ import logging
 import sys
 
 
+log = logging.getLogger("agent2telegram.cli")
+
+
 def _setup_logging(verbose: bool) -> None:
     logging.basicConfig(
         level=logging.DEBUG if verbose else logging.INFO,
@@ -55,6 +58,14 @@ def _cmd_run(args) -> int:
     return 0
 
 
+def _record_proactive_best_effort(recorder, chat_id: int, text: str, message_ids: list[int]) -> None:
+    """Never turn a Telegram-confirmed delivery into a failed notification."""
+    try:
+        recorder(chat_id, text, message_ids)
+    except Exception as e:
+        log.warning("proactive context write failed after confirmed delivery: %s", e)
+
+
 def _cmd_notify(args) -> int:
     """Push a message to the configured owner via the bot — for PROACTIVE notifications from
     cron jobs, background tasks or scripts (e.g. "build finished ✅"). This is the supported way
@@ -83,12 +94,9 @@ def _cmd_notify(args) -> int:
     try:
         chat_id = cfg.allowed_user_ids[0]
         message_ids = TelegramClient(cfg.token).send_message(chat_id, text)
-        try:
-            record_proactive(chat_id, text, message_ids)
-        except OSError as e:
-            # Telegram already confirmed delivery. Context enrichment is best-effort metadata;
-            # failing it must not report the notification as unsent and trigger duplicates.
-            log.warning("proactive context write failed after confirmed delivery: %s", e)
+        # Telegram already confirmed delivery. Context enrichment is best-effort metadata;
+        # failing it must not report the notification as unsent and trigger duplicates.
+        _record_proactive_best_effort(record_proactive, chat_id, text, message_ids)
     except TelegramError as e:
         print(f"✗ send failed: {e}", file=sys.stderr)
         return 1
