@@ -83,7 +83,12 @@ def _cmd_notify(args) -> int:
     try:
         chat_id = cfg.allowed_user_ids[0]
         message_ids = TelegramClient(cfg.token).send_message(chat_id, text)
-        record_proactive(chat_id, text, message_ids)
+        try:
+            record_proactive(chat_id, text, message_ids)
+        except OSError as e:
+            # Telegram already confirmed delivery. Context enrichment is best-effort metadata;
+            # failing it must not report the notification as unsent and trigger duplicates.
+            log.warning("proactive context write failed after confirmed delivery: %s", e)
     except TelegramError as e:
         print(f"✗ send failed: {e}", file=sys.stderr)
         return 1

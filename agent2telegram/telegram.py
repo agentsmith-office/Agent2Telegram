@@ -133,6 +133,19 @@ class TelegramError(Exception):
     pass
 
 
+class TelegramPartialSendError(TelegramError):
+    """A multi-part message failed after at least one part was confirmed.
+
+    ``remaining_text`` contains only parts that were not confirmed, so callers can retry without
+    duplicating the already delivered prefix.
+    """
+
+    def __init__(self, message: str, remaining_text: str, message_ids: list[int]) -> None:
+        super().__init__(message)
+        self.remaining_text = remaining_text
+        self.message_ids = message_ids
+
+
 class TelegramClient:
     def __init__(self, token: str, *, max_retries: int = 5, opener=None) -> None:
         if not token or ":" not in token:
@@ -267,20 +280,29 @@ class TelegramClient:
         log.info("SEND_STARTED chars=%d parts=%d", len(text or ""), len(chunks))
         for index, chunk in enumerate(chunks, 1):
             base = {"chat_id": chat_id, "disable_web_page_preview": "true"}
-            if parse_mode == "auto":
-                try:
-                    result = self._call("sendMessage", {**base, "text": markdown_to_html(chunk), "parse_mode": "HTML"}, timeout=SEND_TIMEOUT)
-                except TelegramError as e:
-                    log.warning("HTML send failed, falling back to plain text: %s", e)
-                    result = self._call("sendMessage", {**base, "text": _strip_markdown(chunk)}, timeout=SEND_TIMEOUT)
-            elif parse_mode:
-                try:
-                    result = self._call("sendMessage", {**base, "text": chunk, "parse_mode": parse_mode}, timeout=SEND_TIMEOUT)
-                except TelegramError as e:
-                    log.warning("send failed with parse_mode=%s, retrying plain: %s", parse_mode, e)
+            try:
+                if parse_mode == "auto":
+                    try:
+                        result = self._call("sendMessage", {**base, "text": markdown_to_html(chunk), "parse_mode": "HTML"}, timeout=SEND_TIMEOUT)
+                    except TelegramError as e:
+                        log.warning("HTML send failed, falling back to plain text: %s", e)
+                        result = self._call("sendMessage", {**base, "text": _strip_markdown(chunk)}, timeout=SEND_TIMEOUT)
+                elif parse_mode:
+                    try:
+                        result = self._call("sendMessage", {**base, "text": chunk, "parse_mode": parse_mode}, timeout=SEND_TIMEOUT)
+                    except TelegramError as e:
+                        log.warning("send failed with parse_mode=%s, retrying plain: %s", parse_mode, e)
+                        result = self._call("sendMessage", {**base, "text": chunk}, timeout=SEND_TIMEOUT)
+                else:
                     result = self._call("sendMessage", {**base, "text": chunk}, timeout=SEND_TIMEOUT)
-            else:
-                result = self._call("sendMessage", {**base, "text": chunk}, timeout=SEND_TIMEOUT)
+            except TelegramError as e:
+                if message_ids:
+                    raise TelegramPartialSendError(
+                        f"part {index}/{len(chunks)} failed after {len(message_ids)} confirmed parts: {e}",
+                        "\n".join(chunks[index - 1:]),
+                        message_ids,
+                    ) from e
+                raise
             message_id = result.get("message_id") if isinstance(result, dict) else None
             if message_id is None:
                 raise TelegramError(f"sendMessage part {index}/{len(chunks)} returned no message_id")

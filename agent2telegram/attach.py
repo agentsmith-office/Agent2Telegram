@@ -29,7 +29,7 @@ from . import readers
 from .auth import AUTH_REQUIRED_NOTICE, AuthState, classify_auth_error
 from .config import Config
 from .session import TmuxSession
-from .telegram import TelegramClient
+from .telegram import TelegramClient, TelegramPartialSendError
 
 log = logging.getLogger("agent2telegram.attach")
 
@@ -585,6 +585,10 @@ class AttachBridge:
             return
         try:
             self.tg.send_message(self._owner_chat, text)
+        except TelegramPartialSendError as e:
+            log.warning("partial forward failed → queued undelivered suffix: %s", e)
+            self._enqueue(e.remaining_text, key)
+            return
         except Exception as e:                        # network reset, 5xx after retries, etc.
             log.warning("forward failed → queued for re-delivery: %s", e)
             self._enqueue(text, key)

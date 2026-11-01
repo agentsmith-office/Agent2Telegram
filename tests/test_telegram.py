@@ -4,7 +4,9 @@ import json
 import unittest
 import urllib.error
 
-from agent2telegram.telegram import TelegramClient, split_message, MAX_MESSAGE_LEN
+from agent2telegram.telegram import (
+    MAX_MESSAGE_LEN, TelegramClient, TelegramPartialSendError, split_message,
+)
 
 
 class SplitMessageTests(unittest.TestCase):
@@ -110,6 +112,17 @@ class TelegramClientTests(unittest.TestCase):
         client = TelegramClient("123:abc", opener=_FakeOpener([_ok({})]))
         with self.assertRaises(Exception):
             client.send_message(42, "hello")
+
+    def test_partial_multipart_failure_exposes_only_undelivered_suffix(self):
+        text = "a" * MAX_MESSAGE_LEN + "\n" + "b" * 20
+        failure = {"ok": False, "description": "temporary failure"}
+        client = TelegramClient("123:abc", max_retries=0, opener=_FakeOpener([
+            _ok({"message_id": 10}), failure, failure,
+        ]))
+        with self.assertRaises(TelegramPartialSendError) as raised:
+            client.send_message(42, text)
+        self.assertEqual(raised.exception.message_ids, [10])
+        self.assertEqual(raised.exception.remaining_text, "b" * 20)
 
 
 if __name__ == "__main__":
